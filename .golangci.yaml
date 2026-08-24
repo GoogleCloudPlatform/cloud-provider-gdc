@@ -1,0 +1,58 @@
+version: "2"
+run:
+  concurrency: 4
+linters:
+  enable:
+    - copyloopvar
+    - ginkgolinter
+    - importas
+    - nilerr
+    - revive
+    - whitespace
+  settings:
+    loggercheck:
+      require-string-key: true
+      no-printf-like: true
+    revive:
+      rules:
+        - name: duplicated-imports
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: context-as-argument
+        - name: early-return
+        - name: exported
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - staticcheck
+        text: 'ST1001:' # should not use dot imports
+      - linters:
+          - staticcheck
+        text: 'ST1006:' # receiver name should be a reflection of its identity; don't use generic names such as "this" or "self"
+      - linters:
+          - errcheck
+        text: 'Error return value of'
+      - path: (.+)\.go$
+        text: Error return value of `testEnv.*` is not checked
+      - path: (.+)\.go$
+        text: 'unused-parameter: '
+      - path: pkg/(cloudprovider|instance|gdc)/(.+)\.go$
+        text: 'exported: '
+      - path: gdc/pkg/(.+)\.go$
+        text: 'exported: '
+      - path: test/(.+)\.go$
+        text: 'exported: '
+    paths:
+      - zz_generated.*\.go$
+      - test/functional/config
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
