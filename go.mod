@@ -39,7 +39,7 @@ require (
 	github.com/googlecloudplatform/google-distributed-cloud-apis v0.0.0-20260824201624-0c18fa0ddc04
 	github.com/hashicorp/go-multierror v1.1.1
 	gopkg.in/ini.v1 v1.67.0
-	helm.sh/helm/v3 v3.19.5
+	helm.sh/helm/v3 v3.20.2
 	k8s.io/cloud-provider v0.0.0-00010101000000-000000000000
 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2
 )
