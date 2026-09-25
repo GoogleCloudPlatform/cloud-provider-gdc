@@ -30,9 +30,9 @@ import (
 )
 
 const (
-	tokenExchangeType      = "urn:ietf:params:oauth:token-type:token-exchange"
-	accessTokenType        = "urn:ietf:params:oauth:token-type:access_token"
-	serviceAccoutTokenType = "urn:k8s:params:oauth:token-type:serviceaccount"
+	tokenExchangeType       = "urn:ietf:params:oauth:token-type:token-exchange"
+	accessTokenType         = "urn:ietf:params:oauth:token-type:access_token"
+	serviceAccountTokenType = "urn:k8s:params:oauth:token-type:serviceaccount"
 )
 
 type Option func(*optionalConfig)
@@ -72,20 +72,31 @@ func NewSTSTokenSource(
 	}
 
 	jwtTS := newJWTTokenSource(saConfig)
+
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if len(cfg.caCert) != 0 {
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(cfg.caCert)
+		tr.TLSClientConfig = &tls.Config{RootCAs: caCertPool}
+	}
+
 	return &stsTokenSource{
-		caCert:         cfg.caCert,
 		tokenURI:       saConfig.TokenURI,
 		audience:       audience,
 		jwtTokenSource: jwtTS,
-		clock:          clock.RealClock{},
+		httpClient: &http.Client{
+			Transport: tr,
+			Timeout:   30 * time.Second,
+		},
+		clock: clock.RealClock{},
 	}
 }
 
 type stsTokenSource struct {
-	caCert         []byte
 	tokenURI       string
 	audience       string
 	jwtTokenSource oauth2.TokenSource
+	httpClient     *http.Client
 	clock          clock.PassiveClock
 }
 
@@ -107,7 +118,7 @@ func (ts *stsTokenSource) Token() (*oauth2.Token, error) {
 		"audience":             ts.audience,
 		"requested_token_type": accessTokenType,
 		"subject_token":        jwtToken.AccessToken,
-		"subject_token_type":   serviceAccoutTokenType,
+		"subject_token_type":   serviceAccountTokenType,
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -121,19 +132,12 @@ func (ts *stsTokenSource) Token() (*oauth2.Token, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	hc := http.DefaultClient
-
-	if len(ts.caCert) != 0 {
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(ts.caCert)
-		hc.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs: caCertPool,
-			},
-		}
+	client := ts.httpClient
+	if client == nil {
+		client = http.DefaultClient
 	}
 
-	resp, err := hc.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch token: %w", err)
 	}
