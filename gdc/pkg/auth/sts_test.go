@@ -46,7 +46,6 @@ func TestSTSToken(t *testing.T) {
 	defer server.Close()
 
 	stsTS := &stsTokenSource{
-		caCert:         []byte("caData"),
 		tokenURI:       server.URL,
 		audience:       "audience",
 		jwtTokenSource: &mockJWTTokenSource{},
@@ -77,7 +76,6 @@ func TestSTSToken_Failed(t *testing.T) {
 	defer server.Close()
 
 	stsTS := &stsTokenSource{
-		caCert:         []byte("caData"),
 		tokenURI:       server.URL,
 		audience:       "audience",
 		jwtTokenSource: &mockJWTTokenSource{},
@@ -104,4 +102,25 @@ func mockResponse() string {
 
 	jsonData, _ := json.Marshal(tokenResp)
 	return string(jsonData)
+}
+
+func TestNewSTSTokenSource_WithCACert(t *testing.T) {
+	sa := &ServiceAccount{
+		PrivateKey: "dummy",
+		TokenURI:   "https://example.com/token",
+	}
+	ts := NewSTSTokenSource("aud", sa, WithCACert([]byte("dummy-ca"))).(*stsTokenSource)
+	if ts.httpClient == nil {
+		t.Fatal("expected httpClient to be configured, got nil")
+	}
+	if ts.httpClient.Timeout != 30*time.Second {
+		t.Errorf("expected timeout 30s, got %v", ts.httpClient.Timeout)
+	}
+	tr, ok := ts.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", ts.httpClient.Transport)
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.RootCAs == nil {
+		t.Error("expected RootCAs to be set in TLSClientConfig")
+	}
 }
