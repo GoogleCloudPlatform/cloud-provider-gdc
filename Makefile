@@ -8,7 +8,7 @@ REGISTRY                          := europe-docker.pkg.dev/gardener-project/publ
 EXECUTABLE                        := gdch-cloud-controller-manager
 REPO_ROOT                         := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 IMAGE_REPOSITORY                  := $(REGISTRY)/cloud-controller-manager-gdch
-VERSION                           ?= v0.1.0-dev
+VERSION                           ?= $(shell cat $(REPO_ROOT)/VERSION)
 IMAGE_TAG                         ?= $(VERSION)
 
 #########################################
