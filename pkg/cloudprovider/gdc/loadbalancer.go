@@ -28,6 +28,8 @@ const (
 	internalLBSubnetAnnotationKey        = "networking.gke.io/load-balancer-subnet"
 	externalLBIPAddressesAnnotationKey   = "networking.gke.io/load-balancer-ip-addresses"
 	internalLBAllowProjectsAnnotationKey = "networking.gke.io/load-balancer-allow-projects"
+	forwardingRuleExternalAnnotationKey  = "networking.private.gdc.goog/forwarding-rule-external"
+	forwardingRuleInternalAnnotationKey  = "networking.private.gdc.goog/forwarding-rule-internal"
 
 	// Annotation Values
 	lbInternal = "internal"

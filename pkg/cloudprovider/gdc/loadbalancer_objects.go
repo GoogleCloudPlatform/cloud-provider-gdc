@@ -289,6 +289,35 @@ func (g *lb) deleteGlobalLeafSubnet(ctx context.Context, name, namespace string)
 	return g.globalMPClient.Delete(ctx, lbSubnet)
 }
 
+func (g *lb) deleteForwardingRuleSubnets(ctx context.Context, name, namespace, annotationKey, subnetPrefix string) error {
+	fwdRuleName := name + fwdRuleSuffix
+	var subnetList ipamglobalv1.SubnetList
+	if err := g.globalMPClient.List(ctx, &subnetList, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("failed to list Global Subnets in namespace %q: %w", namespace, err)
+	}
+
+	var errs error
+	for i := range subnetList.Items {
+		subnet := &subnetList.Items[i]
+		matchesAnnotation := subnet.Annotations != nil && subnet.Annotations[annotationKey] == fwdRuleName
+		matchesPrefix := subnetPrefix != "" && strings.HasPrefix(subnet.Name, subnetPrefix)
+		if !matchesAnnotation && !matchesPrefix {
+			continue
+		}
+		if !subnet.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := g.globalMPClient.Delete(ctx, subnet); err != nil && !errors.IsNotFound(err) {
+			if errors.IsForbidden(err) {
+				klog.Warningf("deleteForwardingRuleSubnets: skipping deletion of Subnet %s/%s (forbidden): %v", namespace, subnet.Name, err)
+				continue
+			}
+			errs = multierror.Append(errs, err)
+		}
+	}
+	return errs
+}
+
 func (g *lb) deleteBackendService(ctx context.Context, name, namespace string) error {
 	backendService := &globalnetworkingv1.BackendService{
 		ObjectMeta: metav1.ObjectMeta{

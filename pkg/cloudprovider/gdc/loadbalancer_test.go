@@ -1703,6 +1703,29 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
 			},
 			wantErr: nil,
 		},
+		{
+			name:    "External Service - External FR already deleted - delete orphaned g-svc external subnet",
+			service: validExternalService,
+			globalClient: initFakeClient(globalScheme, &ipamglobalv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("g-svc-%s%s--extern-398ac5fb", lbName, fwdRuleSuffix),
+					Namespace: lbNamespace,
+					Annotations: map[string]string{
+						forwardingRuleExternalAnnotationKey: lbName + fwdRuleSuffix,
+					},
+				},
+			}),
+			zonalClients: map[string]client.Client{
+				zone: initFakeClient(zonalScheme),
+			},
+			wantGlobalObjs: []client.Object{
+				nil, nil, nil, nil, nil, nil,
+			},
+			wantZonalObjs: []client.Object{
+				nil,
+			},
+			wantErr: nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1727,6 +1750,74 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
 				t.Errorf("EnsureLoadBalancerDeleted(%q) returned error %v", tt.name, err)
 			}
 		})
+	}
+}
+
+func TestDeleteForwardingRuleSubnets(t *testing.T) {
+	gdc, globalScheme, _, err := initFakeGDC()
+	if err != nil {
+		t.Fatalf("initFakeGDC throws error - %s", err.Error())
+	}
+	ctx := context.Background()
+
+	extSubnetName := fmt.Sprintf("g-svc-%s%s--extern-398ac5fb", lbName, fwdRuleSuffix)
+	intSubnetName := fmt.Sprintf("g-svc-%s%s--intern-690d8994", lbName, fwdRuleSuffix)
+	otherSubnetName := "g-svc-aother-fr--extern-11111111"
+
+	extSubnet := &ipamglobalv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      extSubnetName,
+			Namespace: lbNamespace,
+			Annotations: map[string]string{
+				forwardingRuleExternalAnnotationKey: lbName + fwdRuleSuffix,
+			},
+		},
+	}
+	intSubnet := &ipamglobalv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      intSubnetName,
+			Namespace: lbNamespace,
+			Annotations: map[string]string{
+				forwardingRuleInternalAnnotationKey: lbName + fwdRuleSuffix,
+			},
+		},
+	}
+	otherSubnet := &ipamglobalv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      otherSubnetName,
+			Namespace: lbNamespace,
+			Annotations: map[string]string{
+				forwardingRuleExternalAnnotationKey: "aother-fr",
+			},
+		},
+	}
+
+	fakeClient := initFakeClient(globalScheme, extSubnet, intSubnet, otherSubnet)
+	gdcLb := gdc.lb.(*lb)
+	gdcLb.globalMPClient = fakeClient
+
+	extPrefix := fmt.Sprintf("g-svc-%s%s--extern-", lbName, fwdRuleSuffix)
+	if err := gdcLb.deleteForwardingRuleSubnets(ctx, lbName, lbNamespace, forwardingRuleExternalAnnotationKey, extPrefix); err != nil {
+		t.Fatalf("deleteForwardingRuleSubnets(external) returned unexpected error: %v", err)
+	}
+
+	got := &ipamglobalv1.Subnet{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: extSubnetName, Namespace: lbNamespace}, got); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected external subnet %s to be deleted, got err=%v", extSubnetName, err)
+	}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: intSubnetName, Namespace: lbNamespace}, got); err != nil {
+		t.Errorf("expected internal subnet %s to remain before internal cleanup, got err=%v", intSubnetName, err)
+	}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: otherSubnetName, Namespace: lbNamespace}, got); err != nil {
+		t.Errorf("expected unrelated subnet %s to remain, got err=%v", otherSubnetName, err)
+	}
+
+	intPrefix := fmt.Sprintf("g-svc-%s%s--intern-", lbName, fwdRuleSuffix)
+	if err := gdcLb.deleteForwardingRuleSubnets(ctx, lbName, lbNamespace, forwardingRuleInternalAnnotationKey, intPrefix); err != nil {
+		t.Fatalf("deleteForwardingRuleSubnets(internal) returned unexpected error: %v", err)
+	}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: intSubnetName, Namespace: lbNamespace}, got); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected internal subnet %s to be deleted, got err=%v", intSubnetName, err)
 	}
 }
 

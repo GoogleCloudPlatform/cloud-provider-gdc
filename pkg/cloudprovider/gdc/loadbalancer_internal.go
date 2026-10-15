@@ -119,19 +119,27 @@ func (g *lb) ensureInternalLoadBalancer(ctx context.Context, clusterName string,
 func (g *lb) ensureInternalLoadBalancerDeleted(ctx context.Context, clusterName string, service *v1.Service, name, namespace string) error {
 	klog.Infof("ensureInternalLoadBalancerDeleted: %q/%q", service.Namespace, service.Name)
 	err := g.deleteIntFwdRule(ctx, name, namespace)
-
-	// nothing to delete as the forwarding rule does not exist
-	if errors.IsNotFound(err) {
-		klog.Infof("EnsureInternalLoadBalancerDeleted: Forwarding rule not found for service %q/%q", service.Namespace, service.Name)
-		return nil
-	} else if err != nil {
+	fwdRuleNotFound := errors.IsNotFound(err)
+	if err != nil && !fwdRuleNotFound {
 		msg := fmt.Sprintf("deleteIntFwdRule error for %q/%q LB for service %q - %v", namespace, name, service.Name, err)
+		return api.NewRetryError(msg, 10*time.Second)
+	}
+
+	intSubnetPrefix := fmt.Sprintf("g-svc-%s%s--intern-", name, fwdRuleSuffix)
+	if err = g.deleteForwardingRuleSubnets(ctx, name, namespace, forwardingRuleInternalAnnotationKey, intSubnetPrefix); err != nil && !errors.IsNotFound(err) {
+		msg := fmt.Sprintf("deleteForwardingRuleSubnets error for %q/%q LB for service %q - %v", namespace, name, service.Name, err)
 		return api.NewRetryError(msg, 10*time.Second)
 	}
 
 	if err = g.deleteGlobalLeafSubnet(ctx, name, namespace); err != nil && !errors.IsNotFound(err) {
 		msg := fmt.Sprintf("deleteGlobalLeafSubnet error for %q/%q LB for service %q - %v", namespace, name, service.Name, err)
 		return api.NewRetryError(msg, 10*time.Second)
+	}
+
+	// nothing else to delete as the forwarding rule does not exist
+	if fwdRuleNotFound {
+		klog.Infof("EnsureInternalLoadBalancerDeleted: Forwarding rule not found for service %q/%q", service.Namespace, service.Name)
+		return nil
 	}
 
 	if err = g.deleteBackendService(ctx, name, namespace); err != nil && !errors.IsNotFound(err) {
