@@ -1,0 +1,6 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
+reviewers:
+- cloud-provider-gdc-reviewers
+approvers:
+- cloud-provider-gdc-approvers

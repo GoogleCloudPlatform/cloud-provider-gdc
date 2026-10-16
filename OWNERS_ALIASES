@@ -1,0 +1,15 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
+aliases:
+  cloud-provider-gdc-reviewers:
+  - AndreasBurger
+  - dilipkumar2k6
+  - HophinKibona
+  - fuzzdota
+  - gardener-ci-robot
+  cloud-provider-gdc-approvers:
+  - AndreasBurger
+  - dilipkumar2k6
+  - HophinKibona
+  - fuzzdota
+  - gardener-ci-robot
