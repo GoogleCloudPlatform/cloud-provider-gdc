@@ -39,11 +39,59 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1
 	gopkg.in/ini.v1 v1.67.0
 	helm.sh/helm/v3 v3.20.2
+	k8s.io/cli-runtime v0.35.1
 	k8s.io/cloud-provider v0.0.0-00010101000000-000000000000
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 )
 
-require github.com/go-openapi/swag/pools v0.29.2 // indirect
+require (
+	dario.cat/mergo v1.0.1 // indirect
+	github.com/BurntSushi/toml v1.6.0 // indirect
+	github.com/MakeNowJust/heredoc v1.0.0 // indirect
+	github.com/Masterminds/goutils v1.1.1 // indirect
+	github.com/Masterminds/sprig/v3 v3.3.0 // indirect
+	github.com/Masterminds/squirrel v1.5.4 // indirect
+	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
+	github.com/chai2010/gettext-go v1.0.2 // indirect
+	github.com/containerd/containerd v1.7.30 // indirect
+	github.com/containerd/errdefs v0.3.0 // indirect
+	github.com/containerd/log v0.1.0 // indirect
+	github.com/containerd/platforms v0.2.1 // indirect
+	github.com/evanphx/json-patch v5.9.11+incompatible // indirect
+	github.com/exponent-io/jsonpath v0.0.0-20210407135951-1de76d718b3f // indirect
+	github.com/fatih/color v1.13.0 // indirect
+	github.com/go-errors/errors v1.4.2 // indirect
+	github.com/go-gorp/gorp/v3 v3.1.0 // indirect
+	github.com/go-openapi/swag/pools v0.29.2 // indirect
+	github.com/gobwas/glob v0.2.3 // indirect
+	github.com/gosuri/uitable v0.0.4 // indirect
+	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79 // indirect
+	github.com/huandu/xstrings v1.5.0 // indirect
+	github.com/jmoiron/sqlx v1.4.0 // indirect
+	github.com/klauspost/compress v1.19.0 // indirect
+	github.com/lann/builder v0.0.0-20180802200727-47ae307949d0 // indirect
+	github.com/lann/ps v0.0.0-20150810152359-62de8c46ede0 // indirect
+	github.com/lib/pq v1.10.9 // indirect
+	github.com/liggitt/tabwriter v0.0.0-20181228230101-89fcab3d43de // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.17 // indirect
+	github.com/mattn/go-runewidth v0.0.9 // indirect
+	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
+	github.com/monochromegane/go-gitignore v0.0.0-20200626010858-205db1a8cc00 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
+	github.com/opencontainers/image-spec v1.1.1 // indirect
+	github.com/peterbourgon/diskv v2.0.1+incompatible // indirect
+	github.com/rubenv/sql-migrate v1.8.1 // indirect
+	github.com/shopspring/decimal v1.4.0 // indirect
+	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/spf13/cast v1.7.0 // indirect
+	github.com/xlab/treeprint v1.2.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+	k8s.io/kubectl v0.35.1 // indirect
+	oras.land/oras-go/v2 v2.6.0 // indirect
+	sigs.k8s.io/kustomize/api v0.20.1 // indirect
+	sigs.k8s.io/kustomize/kyaml v0.20.1 // indirect
+)
 
 require (
 	cel.dev/expr v0.25.2 // indirect
