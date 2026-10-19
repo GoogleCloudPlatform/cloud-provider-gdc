@@ -54,7 +54,7 @@ is_authorized_maintainer() {
   fi
 
   if printf '%s\n' "${owners_list}" | tr '[:upper:]' '[:lower:]' | grep -Fxq "${actor_lc}" || \
-     printf '%s\n' "${owners_list}" | tr '[:upper:]' '[:lower:]' | grep -Fxq "${actor_base_lc}"; then
+     printf '%s\n' "${owners_list}" | tr '[:upper:]' '[:lower:]' | sed 's/\[bot\]$//' | grep -Fxq "${actor_base_lc}"; then
     return 0
   fi
 
