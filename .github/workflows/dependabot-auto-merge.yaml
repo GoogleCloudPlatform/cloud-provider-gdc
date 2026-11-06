@@ -65,6 +65,13 @@ jobs:
             fi
           fi
 
+          failed_checks=$(gh pr view "${target_pr}" --repo "${GITHUB_REPOSITORY}" --json statusCheckRollup \
+            --jq '[.statusCheckRollup[]? | select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED" or .conclusion == "CANCELLED" or .state == "FAILURE" or .state == "ERROR") | (.name // .context)] | join(", ")')
+          if [[ -n "${failed_checks}" ]]; then
+            echo "::error::Cannot enable auto-merge on ${target_pr}; failing status checks detected: ${failed_checks}"
+            exit 1
+          fi
+
           gh pr review --approve "${target_pr}" --repo "${GITHUB_REPOSITORY}"
           if ! gh pr merge --auto --squash "${target_pr}" --repo "${GITHUB_REPOSITORY}"; then
             echo "::warning::Could not enable GitHub auto-merge on ${target_pr}. Ensure 'Allow auto-merge' is enabled in Repository Settings -> General -> Pull Requests."

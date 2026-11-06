@@ -17,6 +17,7 @@ updates:
         exclude-patterns:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
+          - "helm.sh/helm/v3"
         update-types:
           - minor
           - patch
@@ -26,6 +27,10 @@ updates:
           - "version-update:semver-major"
           - "version-update:semver-minor"
       - dependency-name: "sigs.k8s.io/*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      - dependency-name: "helm.sh/helm/v3"
         update-types:
           - "version-update:semver-major"
           - "version-update:semver-minor"
