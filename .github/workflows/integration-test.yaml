@@ -9,15 +9,6 @@ on:
     types: [opened, synchronize, reopened]
     branches:
       - main
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'OWNERS*'
-      - 'CODEOWNERS'
-      - 'LICENSE*'
-      - 'NOTICE*'
-      - '.gitignore'
-      - '.github/renovate.json5'
   issue_comment:
     types: [created]
   workflow_dispatch:
