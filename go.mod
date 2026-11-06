@@ -23,9 +23,9 @@ require (
 	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
-	k8s.io/api v0.35.2
+	k8s.io/api v0.35.10
 	k8s.io/apiextensions-apiserver v0.35.2 // indirect
-	k8s.io/apimachinery v0.35.2
+	k8s.io/apimachinery v0.35.10
 	k8s.io/apiserver v0.35.2 // indirect
 	k8s.io/client-go v12.0.0+incompatible
 	k8s.io/component-base v0.35.2
@@ -39,7 +39,7 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1
 	gopkg.in/ini.v1 v1.67.3
 	helm.sh/helm/v3 v3.20.2
-	k8s.io/cli-runtime v0.35.1
+	k8s.io/cli-runtime v0.35.10
 	k8s.io/cloud-provider v0.0.0-00010101000000-000000000000
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 )
