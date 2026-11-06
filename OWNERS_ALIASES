@@ -3,6 +3,7 @@
 aliases:
   cloud-provider-gdc-reviewers:
   - AndreasBurger
+  - cmuuss
   - dilipkumar2k6
   - HophinKibona
   - fuzzdota
@@ -11,6 +12,7 @@ aliases:
   - dependabot[bot]
   cloud-provider-gdc-approvers:
   - AndreasBurger
+  - cmuuss
   - dilipkumar2k6
   - HophinKibona
   - fuzzdota

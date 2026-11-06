@@ -1,9 +1,5 @@
 # See https://help.github.com/articles/about-codeowners/
 # for more info about CODEOWNERS file
 
-# Repo owner
-## Default ownership
-* @dilipkumardk
-* @muss
-* @samngo
-* @hkibona
+# Repo owners (must be on a single catch-all '*' line with valid GitHub handles)
+* @dilipkumar2k6 @cmuuss @fuzzdota @HophinKibona
