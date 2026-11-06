@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2026 Google LLC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Dependabot Auto-Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Dependabot Pull Request number to approve and enable auto-merge on'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Approve & Enable Auto-Merge
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        if: github.event_name == 'pull_request'
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Auto-approve and queue auto-merge for SemVer minor/patch updates and github-actions
+      # updates; major or non-SemVer updates remain manual (or can be triggered via workflow_dispatch).
+      - name: Approve and enable auto-merge for minor, patch, and github-actions updates
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.package-ecosystem == 'github-actions'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          target_pr="${PR_URL}"
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            target_pr="${DISPATCH_PR_NUMBER//#/}"
+            target_pr="${target_pr//[[:space:]]/}"
+            if ! [[ "${target_pr}" =~ ^[0-9]+$ ]]; then
+              echo "::error::Invalid pull request number '${DISPATCH_PR_NUMBER}'."
+              exit 1
+            fi
+            author_login=$(gh pr view "${target_pr}" --repo "${GITHUB_REPOSITORY}" --json author --jq '.author.login')
+            if [[ "${author_login}" != "app/dependabot" && "${author_login}" != "dependabot[bot]" ]]; then
+              echo "::error::PR #${target_pr} is authored by '${author_login}', not dependabot[bot]."
+              exit 1
+            fi
+          fi
+
+          gh pr review --approve "${target_pr}" --repo "${GITHUB_REPOSITORY}"
+          if ! gh pr merge --auto --squash "${target_pr}" --repo "${GITHUB_REPOSITORY}"; then
+            echo "::warning::Could not enable GitHub auto-merge on ${target_pr}. Ensure 'Allow auto-merge' is enabled in Repository Settings -> General -> Pull Requests."
+          fi
