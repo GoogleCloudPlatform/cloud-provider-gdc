@@ -36,7 +36,6 @@ require (
 
 require (
 	github.com/googlecloudplatform/google-distributed-cloud-apis v0.0.0-20260824201624-0c18fa0ddc04
-	github.com/hashicorp/go-multierror v1.1.1
 	gopkg.in/ini.v1 v1.67.3
 	helm.sh/helm/v3 v3.20.2
 	k8s.io/cli-runtime v0.35.10
@@ -66,6 +65,7 @@ require (
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/gosuri/uitable v0.0.4 // indirect
 	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79 // indirect
+	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/jmoiron/sqlx v1.4.0 // indirect
 	github.com/klauspost/compress v1.19.0 // indirect

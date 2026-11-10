@@ -16,13 +16,13 @@ package gdc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/hashicorp/go-multierror"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2501,17 +2501,17 @@ func fetchAndCompareLBObjs(wantGlobalObjs, wantZonalObjs []client.Object, global
 	for _, zonalClient := range zonalClients {
 		err := compareClientObjs(zonalClient, zonalKeys, gotZonalObjs, wantZonalObjs)
 		if err != nil {
-			combinedErrors = multierror.Append(combinedErrors, err)
+			combinedErrors = errors.Join(combinedErrors, err)
 		}
 	}
 
 	existingPNPs := &globalnetworkingv1.ProjectNetworkPolicyList{}
 	if err := globalMPClient.List(context.Background(), existingPNPs, client.InNamespace(lbNamespace)); err != nil {
-		return multierror.Append(combinedErrors, fmt.Errorf("list existing PNPs: %w", err))
+		return errors.Join(combinedErrors, fmt.Errorf("list existing PNPs: %w", err))
 	}
 
 	if len(existingPNPs.Items) != len(wantPNPs) {
-		combinedErrors = multierror.Append(combinedErrors, fmt.Errorf("PNP count mismatch: got %d, want %d", len(existingPNPs.Items), len(wantPNPs)))
+		combinedErrors = errors.Join(combinedErrors, fmt.Errorf("PNP count mismatch: got %d, want %d", len(existingPNPs.Items), len(wantPNPs)))
 	} else {
 		for _, wantPnp := range wantPNPs {
 			found := false
@@ -2520,13 +2520,13 @@ func fetchAndCompareLBObjs(wantGlobalObjs, wantZonalObjs []client.Object, global
 					found = true
 					ignoreResourceField := cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion")
 					if diff := cmp.Diff(wantPnp, &gotPnp, ignoreResourceField); diff != "" {
-						combinedErrors = multierror.Append(combinedErrors, fmt.Errorf("comparePNP(%q) returned unexpected diff (-want +got):\n%s", wantPnp.Name, diff))
+						combinedErrors = errors.Join(combinedErrors, fmt.Errorf("comparePNP(%q) returned unexpected diff (-want +got):\n%s", wantPnp.Name, diff))
 					}
 					break
 				}
 			}
 			if !found {
-				combinedErrors = multierror.Append(combinedErrors, fmt.Errorf("expected PNP %s not found", wantPnp.Name))
+				combinedErrors = errors.Join(combinedErrors, fmt.Errorf("expected PNP %s not found", wantPnp.Name))
 			}
 		}
 	}
@@ -2545,7 +2545,7 @@ func compareClientObjs(client client.Client, clientKeys []types.NamespacedName, 
 
 		// want nil, but the object was found. THIS IS A FAILURE.
 		if wantObjs[i] == nil && err == nil {
-			combinedErrors = multierror.Append(combinedErrors, fmt.Errorf("%v: expected object to be deleted, but it was found", clientKeys[i]))
+			combinedErrors = errors.Join(combinedErrors, fmt.Errorf("%v: expected object to be deleted, but it was found", clientKeys[i]))
 			continue
 		}
 
@@ -2556,18 +2556,18 @@ func compareClientObjs(client client.Client, clientKeys []types.NamespacedName, 
 
 		// want an object, but it wasn't found. THIS IS A FAILURE.
 		if wantObjs[i] != nil && k8serrors.IsNotFound(err) {
-			combinedErrors = multierror.Append(combinedErrors, fmt.Errorf("%v: wanted object but it was not found", clientKeys[i]))
+			combinedErrors = errors.Join(combinedErrors, fmt.Errorf("%v: wanted object but it was not found", clientKeys[i]))
 			continue
 		}
 
 		// unexpected errors from the client.
 		if err != nil && !k8serrors.IsNotFound(err) {
-			combinedErrors = multierror.Append(combinedErrors, fmt.Errorf("%v: got unexpected client error: %w", clientKeys[i], err))
+			combinedErrors = errors.Join(combinedErrors, fmt.Errorf("%v: got unexpected client error: %w", clientKeys[i], err))
 			continue
 		}
 
 		if diff := cmp.Diff(wantObjs[i], gotObjs[i], ignoreResourceField); diff != "" {
-			combinedErrors = multierror.Append(combinedErrors, fmt.Errorf("compareResource(%q) returned unexpected diff (-want +got):\n%s", clientKeys[i], diff))
+			combinedErrors = errors.Join(combinedErrors, fmt.Errorf("compareResource(%q) returned unexpected diff (-want +got):\n%s", clientKeys[i], diff))
 		}
 	}
 	return combinedErrors
