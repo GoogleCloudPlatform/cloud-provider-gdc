@@ -22,7 +22,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/hashicorp/go-multierror"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -141,7 +140,7 @@ func (i *instanceImpl) InstanceID(ctx context.Context, nodeName types.NodeName) 
 		if err := k8sClient.Get(ctx, nn, &vmv1.VirtualMachine{}); err == nil {
 			return fmt.Sprintf("%s/%s/%s", i.project, zone, string(nodeName)), nil
 		} else if !k8serrors.IsNotFound(err) {
-			errs = multierror.Append(errs, fmt.Errorf("get vm.VirtualMachine %q/%q from zone %q failed: %w", i.project, nodeName, zone, err))
+			errs = errors.Join(errs, fmt.Errorf("get vm.VirtualMachine %q/%q from zone %q failed: %w", i.project, nodeName, zone, err))
 		}
 	}
 	if errs != nil {

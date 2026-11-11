@@ -18,10 +18,10 @@
 package gdc
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
-	"github.com/hashicorp/go-multierror"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	cloudprovider "k8s.io/cloud-provider"
@@ -138,7 +138,7 @@ func (c *cloud) getZonalClients() (map[string]client.Client, error) {
 		kubeClient, err := gdcclient.Get(gdcConfig, serviceAccount, scheme)
 
 		if err != nil {
-			errs = multierror.Append(errs, err)
+			errs = errors.Join(errs, err)
 			klog.Errorf("Failed to get the zonal client for zone %s: %v", zoneEndpoint.Name, err)
 		} else {
 			zonalClients[zoneEndpoint.Name] = kubeClient

@@ -16,11 +16,11 @@ package gdc
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"reflect"
 	"strings"
 
-	"github.com/hashicorp/go-multierror"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -156,7 +156,7 @@ func (g *lb) createOrUpdateBackend(ctx context.Context, name, namespace, cluster
 			return nil
 		})
 		if err != nil {
-			errs = multierror.Append(errs, err)
+			errs = stderrors.Join(errs, err)
 		}
 	}
 	return errs
@@ -323,7 +323,7 @@ func (g *lb) deleteBackend(ctx context.Context, name, namespace string) error {
 	var errs error
 	for _, mpClient := range g.zonalClients {
 		if err := mpClient.Delete(ctx, backend); err != nil {
-			errs = multierror.Append(errs, err)
+			errs = stderrors.Join(errs, err)
 		}
 	}
 	return errs
