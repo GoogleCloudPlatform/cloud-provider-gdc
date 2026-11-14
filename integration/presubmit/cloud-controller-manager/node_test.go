@@ -122,7 +122,11 @@ func runNodeControllerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 		if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 			current := &corev1.Node{}
 			if err := env.VClusterClient.Get(ctx, client.ObjectKey{Name: node.Name}, current); err != nil {
-				return false, client.IgnoreNotFound(err)
+				// Keep polling across transient port-forward or API read errors instead of aborting.
+				if !apierrors.IsNotFound(err) {
+					t.Logf("Transient error getting Node %q: %v", node.Name, err)
+				}
+				return false, nil
 			}
 
 			// Verify uninitialized taint is removed.
@@ -275,8 +279,18 @@ func findRunningVirtualMachine(ctx context.Context, t *testing.T, env *TestEnv) 
 	t.Helper()
 
 	vmList := &vmv1.VirtualMachineList{}
-	if err := env.MgmtClient.List(ctx, vmList, client.InNamespace(env.Project)); err != nil {
-		t.Fatalf("failed to list VirtualMachines in namespace %q: %v", env.Project, err)
+	var lastErr error
+	// Poll MgmtClient.List so transient Zonal Management API or initial REST discovery
+	// connection resets do not fail the test on a single attempt.
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
+		if listErr := env.MgmtClient.List(ctx, vmList, client.InNamespace(env.Project)); listErr != nil {
+			lastErr = listErr
+			t.Logf("Transient error listing VirtualMachines in namespace %q: %v", env.Project, listErr)
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("failed to list VirtualMachines in namespace %q: %v (poll err: %v)", env.Project, lastErr, err)
 	}
 
 	for i := range vmList.Items {

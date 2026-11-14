@@ -58,23 +58,25 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 		// 2. Update Service ports and switch ExternalTrafficPolicy to Local to trigger
 		// ForwardingRule, BackendService, ProjectNetworkPolicy, and HealthCheck updates.
 		t.Logf("Updating Service %s to add port 8443 and set ExternalTrafficPolicy=Local", svc.Name)
-		if err := env.VClusterClient.Get(ctx, client.ObjectKeyFromObject(svc), currentSvc); err != nil {
-			t.Fatalf("failed to get Service %s for update: %v", svc.Name, err)
-		}
-		currentSvc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
-		currentSvc.Spec.Ports = append(currentSvc.Spec.Ports, corev1.ServicePort{
-			Name:       "https-alt",
-			Protocol:   corev1.ProtocolTCP,
-			Port:       8443,
-			TargetPort: intstr.FromInt32(8443),
+		currentSvc = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			s.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
+			// Guard port insertion so retrying after a 409 Conflict or dropped response remains idempotent.
+			hasAlt := false
+			for _, p := range s.Spec.Ports {
+				if p.Name == "https-alt" {
+					hasAlt = true
+					break
+				}
+			}
+			if !hasAlt {
+				s.Spec.Ports = append(s.Spec.Ports, corev1.ServicePort{
+					Name:       "https-alt",
+					Protocol:   corev1.ProtocolTCP,
+					Port:       8443,
+					TargetPort: intstr.FromInt32(8443),
+				})
+			}
 		})
-		if err := env.VClusterClient.Update(ctx, currentSvc); err != nil {
-			t.Fatalf("failed to update Service %s: %v", svc.Name, err)
-		}
-
-		if err := env.VClusterClient.Get(ctx, client.ObjectKeyFromObject(svc), currentSvc); err != nil {
-			t.Fatalf("failed to re-fetch Service %s after update: %v", svc.Name, err)
-		}
 		if currentSvc.Spec.HealthCheckNodePort == 0 {
 			t.Fatalf("expected HealthCheckNodePort to be allocated on Service %s when ExternalTrafficPolicy=Local", svc.Name)
 		}
@@ -83,16 +85,12 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 
 		// 3. Convert External LoadBalancer (ELB) -> Internal LoadBalancer (ILB) in-place.
 		t.Logf("Converting Service %s from External LB to Internal LB", svc.Name)
-		if err := env.VClusterClient.Get(ctx, client.ObjectKeyFromObject(svc), currentSvc); err != nil {
-			t.Fatalf("failed to get Service %s for conversion: %v", svc.Name, err)
-		}
-		if currentSvc.Annotations == nil {
-			currentSvc.Annotations = make(map[string]string)
-		}
-		currentSvc.Annotations[lbTypeAnnotationKey] = lbTypeInternal
-		if err := env.VClusterClient.Update(ctx, currentSvc); err != nil {
-			t.Fatalf("failed to update Service %s to Internal LB: %v", svc.Name, err)
-		}
+		_ = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			if s.Annotations == nil {
+				s.Annotations = make(map[string]string)
+			}
+			s.Annotations[lbTypeAnnotationKey] = lbTypeInternal
+		})
 
 		ilbVIP, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, elbVIP)
 		t.Logf("Service %s converted from ELB VIP %s to ILB VIP %s", svc.Name, elbVIP, ilbVIP)
@@ -131,49 +129,39 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 		// 2. Mutate networking.gke.io/load-balancer-allow-projects to allow an additional project ("sapbtp,platform").
 		secondaryProject := "platform"
 		t.Logf("Updating Service %s annotation %s=%q", svc.Name, internalLBAllowProjectsAnnotationKey, env.Project+","+secondaryProject)
-		if err := env.VClusterClient.Get(ctx, client.ObjectKeyFromObject(svc), currentSvc); err != nil {
-			t.Fatalf("failed to get Service %s: %v", svc.Name, err)
-		}
-		currentSvc.Annotations[internalLBAllowProjectsAnnotationKey] = env.Project + "," + secondaryProject
-		if err := env.VClusterClient.Update(ctx, currentSvc); err != nil {
-			t.Fatalf("failed to update Service %s allow-projects annotation: %v", svc.Name, err)
-		}
+		currentSvc = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			if s.Annotations == nil {
+				s.Annotations = make(map[string]string)
+			}
+			s.Annotations[internalLBAllowProjectsAnnotationKey] = env.Project + "," + secondaryProject
+		})
 		verifyInternalLBResources(ctx, t, env, currentSvc, lbName, ilbVIP, nil, defaultHealthzPort, []string{env.Project, secondaryProject}, false)
 
 		// 3. Mutate networking.gke.io/load-balancer-allow-projects to wildcard "*" and verify per-project PNPs are pruned.
 		t.Logf("Updating Service %s annotation %s=\"*\"", svc.Name, internalLBAllowProjectsAnnotationKey)
-		if err := env.VClusterClient.Get(ctx, client.ObjectKeyFromObject(svc), currentSvc); err != nil {
-			t.Fatalf("failed to get Service %s: %v", svc.Name, err)
-		}
-		currentSvc.Annotations[internalLBAllowProjectsAnnotationKey] = "*"
-		if err := env.VClusterClient.Update(ctx, currentSvc); err != nil {
-			t.Fatalf("failed to update Service %s allow-projects to wildcard: %v", svc.Name, err)
-		}
+		currentSvc = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			if s.Annotations == nil {
+				s.Annotations = make(map[string]string)
+			}
+			s.Annotations[internalLBAllowProjectsAnnotationKey] = "*"
+		})
 		verifyInternalLBResources(ctx, t, env, currentSvc, lbName, ilbVIP, nil, defaultHealthzPort, nil, true)
 		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: fmt.Sprintf("ilb-%s-%s", svcUID, env.Project)}, &globalnetworkingv1.ProjectNetworkPolicy{})
 		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: fmt.Sprintf("ilb-%s-%s", svcUID, secondaryProject)}, &globalnetworkingv1.ProjectNetworkPolicy{})
 
 		// 4. Remove networking.gke.io/load-balancer-allow-projects and verify wildcard PNP is pruned and default project PNP is restored.
 		t.Logf("Removing annotation %s from Service %s", internalLBAllowProjectsAnnotationKey, svc.Name)
-		if err := env.VClusterClient.Get(ctx, client.ObjectKeyFromObject(svc), currentSvc); err != nil {
-			t.Fatalf("failed to get Service %s: %v", svc.Name, err)
-		}
-		delete(currentSvc.Annotations, internalLBAllowProjectsAnnotationKey)
-		if err := env.VClusterClient.Update(ctx, currentSvc); err != nil {
-			t.Fatalf("failed to remove allow-projects annotation from Service %s: %v", svc.Name, err)
-		}
+		currentSvc = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			delete(s.Annotations, internalLBAllowProjectsAnnotationKey)
+		})
 		verifyInternalLBResources(ctx, t, env, currentSvc, lbName, ilbVIP, nil, defaultHealthzPort, []string{env.Project}, false)
 		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: fmt.Sprintf("ilb-%s-all", svcUID)}, &globalnetworkingv1.ProjectNetworkPolicy{})
 
 		// 5. Convert Internal LoadBalancer (ILB) -> External LoadBalancer (ELB) in-place.
 		t.Logf("Converting Service %s from Internal LB to External LB", svc.Name)
-		if err := env.VClusterClient.Get(ctx, client.ObjectKeyFromObject(svc), currentSvc); err != nil {
-			t.Fatalf("failed to get Service %s for conversion to ELB: %v", svc.Name, err)
-		}
-		delete(currentSvc.Annotations, lbTypeAnnotationKey)
-		if err := env.VClusterClient.Update(ctx, currentSvc); err != nil {
-			t.Fatalf("failed to update Service %s to External LB: %v", svc.Name, err)
-		}
+		_ = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			delete(s.Annotations, lbTypeAnnotationKey)
+		})
 
 		elbVIP, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, ilbVIP)
 		t.Logf("Service %s converted from ILB VIP %s to ELB VIP %s", svc.Name, ilbVIP, elbVIP)
@@ -199,10 +187,19 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 			deleteTestSubnet(bgCtx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: ilbBranchName})
 		})
 
-		// Fetch the existing public Branch Subnet CIDR in the project.
+		// Fetch the existing public Branch Subnet CIDR in the project, polling across
+		// any transient Global API connection resets.
 		elbParentBranch := &ipamglobalv1.Subnet{}
-		if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: elbParentBranchName}, elbParentBranch); err != nil {
-			t.Fatalf("failed to get public parent Branch Subnet %s/%s: %v", env.Project, elbParentBranchName, err)
+		var parentGetErr error
+		if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
+			if getErr := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: elbParentBranchName}, elbParentBranch); getErr != nil {
+				parentGetErr = getErr
+				t.Logf("Transient error getting public parent Branch Subnet %s/%s: %v", env.Project, elbParentBranchName, getErr)
+				return false, nil
+			}
+			return true, nil
+		}); err != nil {
+			t.Fatalf("failed to get public parent Branch Subnet %s/%s: %v (poll err: %v)", env.Project, elbParentBranchName, parentGetErr, err)
 		}
 		if elbParentBranch.Status.IPv4Allocation == nil || elbParentBranch.Status.IPv4Allocation.CIDR == "" {
 			t.Fatalf("public parent Branch Subnet %s/%s has no IPv4 CIDR allocated", env.Project, elbParentBranchName)
@@ -264,10 +261,18 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 			verifyExternalLBResources(ctx, t, env, currentSvc, lbName, vip, ptr.To(elbLeafName), defaultHealthzPort)
 
 			// Verify no managed child subnet (<lbName>-sb) was created when a Leaf subnet is supplied directly.
+			// Retry transient transport errors before asserting that the final result is NotFound.
 			managedSubnet := &ipamglobalv1.Subnet{}
-			err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + subnetSuffix}, managedSubnet)
-			if !apierrors.IsNotFound(err) {
-				t.Fatalf("expected no managed Leaf subnet %s for direct Leaf subnet annotation, got err=%v", lbName+subnetSuffix, err)
+			var managedSubnetErr error
+			if err := wait.PollUntilContextTimeout(ctx, pollInterval, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+				managedSubnetErr = env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + subnetSuffix}, managedSubnet)
+				if apierrors.IsNotFound(managedSubnetErr) || managedSubnetErr == nil {
+					return true, nil
+				}
+				t.Logf("Transient error checking managed Leaf subnet %s: %v", lbName+subnetSuffix, managedSubnetErr)
+				return false, nil
+			}); err != nil || !apierrors.IsNotFound(managedSubnetErr) {
+				t.Fatalf("expected no managed Leaf subnet %s for direct Leaf subnet annotation, got err=%v (poll err=%v)", lbName+subnetSuffix, managedSubnetErr, err)
 			}
 
 			deleteServiceAndWait(ctx, t, env.VClusterClient, svc.Namespace, svc.Name)
@@ -389,6 +394,49 @@ func newLoadBalancerService(name, namespace string, annotations map[string]strin
 	}
 }
 
+// mutateServiceWithRetry re-fetches and updates a vcluster Service inside a poll
+// loop so optimistic-concurrency conflicts (e.g. concurrent CCM status/finalizer
+// writes) and transient port-forward resets do not fail the test.
+func mutateServiceWithRetry(
+	ctx context.Context,
+	t *testing.T,
+	vclusterClient client.Client,
+	key client.ObjectKey,
+	mutate func(*corev1.Service),
+) *corev1.Service {
+	t.Helper()
+	updated := &corev1.Service{}
+	var lastErr error
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		if getErr := vclusterClient.Get(ctx, key, updated); getErr != nil {
+			lastErr = getErr
+			t.Logf("Transient error getting Service %s: %v", key, getErr)
+			return false, nil
+		}
+		mutate(updated)
+		if updateErr := vclusterClient.Update(ctx, updated); updateErr != nil {
+			lastErr = updateErr
+			t.Logf("Transient error updating Service %s: %v", key, updateErr)
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("failed to mutate Service %s: %v (poll err: %v)", key, lastErr, err)
+	}
+	return updated
+}
+
+// retryableGetErr logs non-NotFound read errors and returns (false, nil) so
+// wait.PollUntilContextTimeout keeps polling across transient network/API resets
+// instead of aborting immediately as client.IgnoreNotFound(err) would.
+func retryableGetErr(t *testing.T, desc string, err error) (bool, error) {
+	t.Helper()
+	if !apierrors.IsNotFound(err) {
+		t.Logf("Transient error reading %s: %v", desc, err)
+	}
+	return false, nil
+}
+
 func waitForServiceLoadBalancerIP(
 	ctx context.Context,
 	t *testing.T,
@@ -401,7 +449,7 @@ func waitForServiceLoadBalancerIP(
 	latestSvc := &corev1.Service{}
 	err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		if err := vclusterClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, latestSvc); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, fmt.Sprintf("Service %s/%s", namespace, name), err)
 		}
 		if len(latestSvc.Status.LoadBalancer.Ingress) == 0 {
 			return false, nil
@@ -435,7 +483,7 @@ func verifyExternalLBResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		globalEFR := &globalnetworkingv1.ForwardingRuleExternal{}
 		if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + fwdRuleSuffix}, globalEFR); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Global ForwardingRuleExternal "+lbName+fwdRuleSuffix, err)
 		}
 		if globalEFR.Spec.BackendServiceRef == nil || globalEFR.Spec.BackendServiceRef.Name != lbName+backendServiceSuffix {
 			return false, nil
@@ -468,7 +516,7 @@ func verifyExternalLBResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		zonalEFR := &networkingv1.ForwardingRuleExternal{}
 		if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + fwdRuleSuffix}, zonalEFR); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Zonal ForwardingRuleExternal "+lbName+fwdRuleSuffix, err)
 		}
 		return zonalEFR.Status.CIDR == expectedCIDR && meta.IsStatusConditionTrue(zonalEFR.Status.Conditions, "Ready"), nil
 	}); err != nil {
@@ -482,7 +530,7 @@ func verifyExternalLBResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		globalPNP := &globalnetworkingv1.ProjectNetworkPolicy{}
 		if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName}, globalPNP); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Global ProjectNetworkPolicy "+lbName, err)
 		}
 		if globalPNP.Labels[pnpLabelServiceUID] != string(svc.UID) {
 			return false, nil
@@ -498,7 +546,7 @@ func verifyExternalLBResources(
 		}
 		zonalPNP := &networkingv1.ProjectNetworkPolicy{}
 		if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName}, zonalPNP); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Zonal ProjectNetworkPolicy "+lbName, err)
 		}
 		return meta.IsStatusConditionTrue(zonalPNP.Status.Conditions, "Ready"), nil
 	}); err != nil {
@@ -524,7 +572,7 @@ func verifyInternalLBResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		globalIFR := &globalnetworkingv1.ForwardingRuleInternal{}
 		if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + fwdRuleSuffix}, globalIFR); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Global ForwardingRuleInternal "+lbName+fwdRuleSuffix, err)
 		}
 		if globalIFR.Spec.BackendServiceRef == nil || globalIFR.Spec.BackendServiceRef.Name != lbName+backendServiceSuffix {
 			return false, nil
@@ -557,7 +605,7 @@ func verifyInternalLBResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		zonalIFR := &networkingv1.ForwardingRuleInternal{}
 		if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + fwdRuleSuffix}, zonalIFR); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Zonal ForwardingRuleInternal "+lbName+fwdRuleSuffix, err)
 		}
 		return zonalIFR.Status.CIDR == expectedCIDR && meta.IsStatusConditionTrue(zonalIFR.Status.Conditions, "Ready"), nil
 	}); err != nil {
@@ -574,7 +622,7 @@ func verifyInternalLBResources(
 		if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 			pnp := &globalnetworkingv1.ProjectNetworkPolicy{}
 			if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: pnpName}, pnp); err != nil {
-				return false, client.IgnoreNotFound(err)
+				return retryableGetErr(t, "Global ProjectNetworkPolicy "+pnpName, err)
 			}
 			if pnp.Labels[pnpLabelServiceUID] != svcUID {
 				return false, nil
@@ -591,7 +639,7 @@ func verifyInternalLBResources(
 		if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 			pnp := &globalnetworkingv1.ProjectNetworkPolicy{}
 			if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: pnpName}, pnp); err != nil {
-				return false, client.IgnoreNotFound(err)
+				return retryableGetErr(t, "Global ProjectNetworkPolicy "+pnpName, err)
 			}
 			if pnp.Labels[pnpLabelServiceUID] != svcUID || pnp.Labels[ilbPnpLabelAllowedProject] != allowedProj {
 				return false, nil
@@ -626,7 +674,7 @@ func verifyCommonLBBackendAndHealthResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		globalBS := &globalnetworkingv1.BackendService{}
 		if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: besName}, globalBS); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Global BackendService "+besName, err)
 		}
 		if globalBS.Labels[besSelectorLabel] != besName {
 			return false, nil
@@ -640,7 +688,7 @@ func verifyCommonLBBackendAndHealthResources(
 
 		zonalBS := &networkingv1.BackendService{}
 		if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: besName}, zonalBS); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Zonal BackendService "+besName, err)
 		}
 		if zonalBS.Status.BackendServicePolicyRef == nil || *zonalBS.Status.BackendServicePolicyRef != bepName {
 			return false, nil
@@ -654,7 +702,7 @@ func verifyCommonLBBackendAndHealthResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		globalBSP := &globalnetworkingv1.BackendServicePolicy{}
 		if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: bepName}, globalBSP); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Global BackendServicePolicy "+bepName, err)
 		}
 		if globalBSP.Spec.SessionAffinity != networkingv1.SessionAffinityClientIpDstPortProto {
 			return false, nil
@@ -665,7 +713,7 @@ func verifyCommonLBBackendAndHealthResources(
 
 		zonalBSP := &networkingv1.BackendServicePolicy{}
 		if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: bepName}, zonalBSP); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Zonal BackendServicePolicy "+bepName, err)
 		}
 		return zonalBSP.Spec.SessionAffinity == networkingv1.SessionAffinityClientIpDstPortProto, nil
 	}); err != nil {
@@ -676,7 +724,7 @@ func verifyCommonLBBackendAndHealthResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		zonalBE := &networkingv1.Backend{}
 		if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: beName}, zonalBE); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Zonal Backend "+beName, err)
 		}
 		if zonalBE.Spec.EndpointsLabels.MatchLabels[clusterSelectorLabel] != env.ClusterName {
 			return false, nil
@@ -693,7 +741,7 @@ func verifyCommonLBBackendAndHealthResources(
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		globalHC := &globalnetworkingv1.HealthCheck{}
 		if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: hcName}, globalHC); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Global HealthCheck "+hcName, err)
 		}
 		if globalHC.Spec.HTTPHealthCheck == nil ||
 			globalHC.Spec.HTTPHealthCheck.Port != expectedHealthCheckPort ||
@@ -703,7 +751,7 @@ func verifyCommonLBBackendAndHealthResources(
 
 		zonalHC := &networkingv1.HealthCheck{}
 		if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: hcName}, zonalHC); err != nil {
-			return false, client.IgnoreNotFound(err)
+			return retryableGetErr(t, "Zonal HealthCheck "+hcName, err)
 		}
 		return zonalHC.Spec.HTTPHealthCheck != nil &&
 			zonalHC.Spec.HTTPHealthCheck.Port == expectedHealthCheckPort &&
@@ -722,8 +770,17 @@ func verifyManagedChildSubnet(
 	t.Helper()
 
 	s := &ipamglobalv1.Subnet{}
-	if err := globalClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: managedSubnetName}, s); err != nil {
-		t.Fatalf("failed to get managed Leaf Subnet %s/%s: %v", namespace, managedSubnetName, err)
+	var lastErr error
+	// Poll GlobalClient.Get so transient Global API connection resets do not abort verification.
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
+		if getErr := globalClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: managedSubnetName}, s); getErr != nil {
+			lastErr = getErr
+			t.Logf("Transient error getting managed Leaf Subnet %s/%s: %v", namespace, managedSubnetName, getErr)
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("failed to get managed Leaf Subnet %s/%s: %v (poll err: %v)", namespace, managedSubnetName, lastErr, err)
 	}
 	if s.Spec.Type != ipamv1.Leaf {
 		t.Fatalf("expected managed Subnet %s/%s to have type Leaf, got %s", namespace, managedSubnetName, s.Spec.Type)
@@ -865,7 +922,7 @@ func ensureTestSubnet(ctx context.Context, t *testing.T, globalClient client.Cli
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		current := &ipamglobalv1.Subnet{}
 		if getErr := globalClient.Get(ctx, client.ObjectKey{Namespace: spec.Namespace, Name: spec.Name}, current); getErr != nil {
-			return false, client.IgnoreNotFound(getErr)
+			return retryableGetErr(t, fmt.Sprintf("Subnet %s/%s", spec.Namespace, spec.Name), getErr)
 		}
 		if meta.IsStatusConditionTrue(current.Status.Conditions, "Ready") && current.Status.IPv4Allocation != nil && current.Status.IPv4Allocation.CIDR != "" {
 			cidr = current.Status.IPv4Allocation.CIDR
