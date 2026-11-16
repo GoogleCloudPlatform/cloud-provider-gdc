@@ -19,6 +19,8 @@ package client
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -26,6 +28,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/googlecloudplatform/cloud-provider-gdc/gdc/pkg/auth"
+)
+
+const (
+	// Short TCP dial timeout so new connections to Global or Zonal API servers
+	// fail fast when an upstream load-balancer backend is unreachable.
+	defaultDialTimeout     = 5 * time.Second
+	defaultKeepAlivePeriod = 30 * time.Second
 )
 
 type KubeClients struct {
@@ -66,6 +75,10 @@ func getRESTConfig(config *OrgClusterConfig, serviceAccount *auth.ServiceAccount
 	stsTS := auth.NewCachedSTSTokenSource(audience, serviceAccount, auth.WithCACert(certData))
 	cfg := &rest.Config{
 		Host: config.OrgClusterURL,
+		Dial: (&net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: defaultKeepAlivePeriod,
+		}).DialContext,
 		TLSClientConfig: rest.TLSClientConfig{
 			CAData: certData,
 		},

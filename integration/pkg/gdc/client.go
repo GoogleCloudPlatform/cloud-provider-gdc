@@ -16,7 +16,9 @@ package gdc
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
@@ -27,8 +29,11 @@ import (
 )
 
 const (
-	defaultClientQPS   = 100.0
-	defaultClientBurst = 150
+	defaultClientQPS       = 100.0
+	defaultClientBurst     = 150
+	defaultDialTimeout     = 5 * time.Second
+	defaultKeepAlivePeriod = 30 * time.Second
+	kubeconfigMaxAttempts  = 4
 )
 
 // GetUserClusterKubeconfig fetches credentials for a user cluster using the gdcloud CLI.
@@ -38,7 +43,21 @@ func GetUserClusterKubeconfig(gdcloudClient *gdcloud.TestingClient, zone, projec
 	if err := os.Setenv("KUBECONFIG", kubeconfigPath); err != nil {
 		return "", fmt.Errorf("unable to set KUBECONFIG variable %w", err)
 	}
-	result, err := gdcloudClient.Exec("clusters", "get-credentials", cluster, "--project="+project, "--zone="+zone, "--standard")
+	var (
+		result []byte
+		err    error
+	)
+	// Retry credential retrieval to tolerate transient gateway/VIP connection resets
+	// when the gdcloud CLI queries the remote GDC API server.
+	for attempt := 1; attempt <= kubeconfigMaxAttempts; attempt++ {
+		result, err = gdcloudClient.Exec("clusters", "get-credentials", cluster, "--project="+project, "--zone="+zone, "--standard")
+		if err == nil {
+			break
+		}
+		if attempt < kubeconfigMaxAttempts {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to get cluster credentials (output: %s): %w", result, err)
 	}
@@ -61,6 +80,11 @@ func GetUserClusterClient(gdcloudClient *gdcloud.TestingClient, zone, project, c
 	if err != nil {
 		return nil, fmt.Errorf("error building kubeconfig: %w", err)
 	}
+	// Fail fast on unreachable User Cluster ingress backends instead of blocking on a 30s OS dial timeout.
+	config.Dial = (&net.Dialer{
+		Timeout:   defaultDialTimeout,
+		KeepAlive: defaultKeepAlivePeriod,
+	}).DialContext
 	config.QPS = defaultClientQPS
 	config.Burst = defaultClientBurst
 	return client.NewWithWatch(config, client.Options{

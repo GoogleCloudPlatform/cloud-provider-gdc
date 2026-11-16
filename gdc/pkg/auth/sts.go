@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -33,6 +34,16 @@ const (
 	tokenExchangeType       = "urn:ietf:params:oauth:token-type:token-exchange"
 	accessTokenType         = "urn:ietf:params:oauth:token-type:access_token"
 	serviceAccountTokenType = "urn:k8s:params:oauth:token-type:serviceaccount"
+
+	// Bound TCP dial and TLS handshake timeouts so connections hitting an
+	// unhealthy load-balancer backend fail quickly instead of stalling for 15-30s,
+	// and retry transient failures with capped exponential backoff.
+	stsDialTimeout           = 5 * time.Second
+	stsTLSHandshakeTimeout   = 5 * time.Second
+	stsKeepAlivePeriod       = 30 * time.Second
+	stsDefaultMaxAttempts    = 6
+	stsDefaultInitialBackoff = 500 * time.Millisecond
+	stsMaxBackoff            = 4 * time.Second
 )
 
 type Option func(*optionalConfig)
@@ -74,6 +85,13 @@ func NewSTSTokenSource(
 	jwtTS := newJWTTokenSource(saConfig)
 
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// Fail fast on dead VIP backends during connection setup while retaining the
+	// 30s per-attempt request timeout on httpClient below.
+	tr.DialContext = (&net.Dialer{
+		Timeout:   stsDialTimeout,
+		KeepAlive: stsKeepAlivePeriod,
+	}).DialContext
+	tr.TLSHandshakeTimeout = stsTLSHandshakeTimeout
 	if len(cfg.caCert) != 0 {
 		caCertPool := x509.NewCertPool()
 		caCertPool.AppendCertsFromPEM(cfg.caCert)
@@ -88,7 +106,9 @@ func NewSTSTokenSource(
 			Transport: tr,
 			Timeout:   30 * time.Second,
 		},
-		clock: clock.RealClock{},
+		clock:          clock.RealClock{},
+		maxAttempts:    stsDefaultMaxAttempts,
+		initialBackoff: stsDefaultInitialBackoff,
 	}
 }
 
@@ -98,6 +118,9 @@ type stsTokenSource struct {
 	jwtTokenSource oauth2.TokenSource
 	httpClient     *http.Client
 	clock          clock.PassiveClock
+	maxAttempts    int                 // defaults to stsDefaultMaxAttempts when <= 0
+	initialBackoff time.Duration       // defaults to stsDefaultInitialBackoff when <= 0
+	sleepFn        func(time.Duration) // injectable sleep hook to keep unit tests fast
 }
 
 type generateAccessTokenResp struct {
@@ -125,34 +148,74 @@ func (ts *stsTokenSource) Token() (*oauth2.Token, error) {
 		return nil, fmt.Errorf("marshal request body: %v", err)
 	}
 
-	body := bytes.NewReader(jsonData)
-	req, err := http.NewRequest("POST", ts.tokenURI, body)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
 	client := ts.httpClient
 	if client == nil {
 		client = http.DefaultClient
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch token: %w", err)
+	maxAttempts := ts.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = stsDefaultMaxAttempts
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read fetched token: %w", err)
+	backoff := ts.initialBackoff
+	if backoff <= 0 {
+		backoff = stsDefaultInitialBackoff
+	}
+	sleep := ts.sleepFn
+	if sleep == nil {
+		sleep = time.Sleep
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, &oauth2.RetrieveError{
-			Response: resp,
-			Body:     respBody,
+	var (
+		respBody []byte
+		lastErr  error
+	)
+	// Retry transient transport errors, truncated body reads, HTTP 429, and HTTP 5xx
+	// responses so a single unhealthy STS/ingress replica does not fail authentication.
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Create a fresh body reader on every attempt because client.Do consumes it.
+		req, reqErr := http.NewRequest("POST", ts.tokenURI, bytes.NewReader(jsonData))
+		if reqErr != nil {
+			return nil, fmt.Errorf("create request: %v", reqErr)
 		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			lastErr = fmt.Errorf("fetch token: %w", doErr)
+		} else {
+			// Close resp.Body immediately inside the loop rather than deferring until Token() returns.
+			bodyBytes, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr != nil {
+				lastErr = fmt.Errorf("read fetched token: %w", readErr)
+			} else if resp.StatusCode == http.StatusOK {
+				respBody = bodyBytes
+				lastErr = nil
+				break
+			} else {
+				retrieveErr := &oauth2.RetrieveError{
+					Response: resp,
+					Body:     bodyBytes,
+				}
+				// Do not retry permanent 4xx client/credential errors (except 429 Too Many Requests).
+				if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < http.StatusInternalServerError {
+					return nil, retrieveErr
+				}
+				lastErr = retrieveErr
+			}
+		}
+
+		if attempt < maxAttempts {
+			sleep(backoff)
+			backoff *= 2
+			if backoff > stsMaxBackoff {
+				backoff = stsMaxBackoff
+			}
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 
 	var tokenResp generateAccessTokenResp

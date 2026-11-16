@@ -60,7 +60,20 @@ func setupTestEnvironment(ctx context.Context, t *testing.T) *TestEnv {
 
 	// 1. Initialize hermetic gdcloud client and obtain User Cluster kubeconfig/client.
 	consoleURL := fmt.Sprintf("https://console.%s.%s.%s", cfg.Org, cfg.Zone, cfg.LabURL)
-	gdcTestingClient, err := gdcloud.NewTestingClient(cfg.CAFile, cfg.SAFile, consoleURL)
+	var (
+		gdcTestingClient *gdcloud.TestingClient
+		err              error
+	)
+	// Retry gdcloud service-account activation in case the console/STS ingress VIP
+	// routes an initial connection to an unhealthy upstream backend.
+	for attempt := 1; attempt <= 4; attempt++ {
+		gdcTestingClient, err = gdcloud.NewTestingClient(cfg.CAFile, cfg.SAFile, consoleURL)
+		if err == nil {
+			break
+		}
+		t.Logf("Transient error initializing gdcloud client (attempt %d/4): %v", attempt, err)
+		time.Sleep(time.Duration(attempt) * 2 * time.Second)
+	}
 	if err != nil {
 		t.Fatalf("failed to initialize gdcloud client: %v", err)
 	}
@@ -121,7 +134,16 @@ func setupTestEnvironment(ctx context.Context, t *testing.T) *TestEnv {
 	hostNamespace := "ccm-e2e-" + cfg.CommitHash
 	clusterName := hostNamespace
 	t.Logf("Creating host namespace %q on VUC %q", hostNamespace, cfg.VUC)
-	if err := kubernetes.CreateNamespace(ctx, hostClient, hostNamespace); err != nil && !apierrors.IsAlreadyExists(err) {
+	// Poll namespace creation so transient User Cluster API connection resets do not
+	// fail setup; treat AlreadyExists as success if a prior attempt committed server-side.
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		createErr := kubernetes.CreateNamespace(ctx, hostClient, hostNamespace)
+		if createErr == nil || apierrors.IsAlreadyExists(createErr) {
+			return true, nil
+		}
+		t.Logf("Transient error creating host namespace %q: %v", hostNamespace, createErr)
+		return false, nil
+	}); err != nil {
 		t.Fatalf("failed to create host namespace %q: %v", hostNamespace, err)
 	}
 	t.Cleanup(func() {
@@ -264,10 +286,12 @@ func setupVCluster(
 	vcSecret := &corev1.Secret{}
 	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
 		if err := hostClient.Get(ctx, client.ObjectKey{Namespace: hostNamespace, Name: secretName}, vcSecret); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
+			// Return (false, nil) on transient API/transport errors as well as NotFound so
+			// PollUntilContextTimeout keeps retrying instead of aborting on the first blip.
+			if !apierrors.IsNotFound(err) {
+				t.Logf("Transient error getting vcluster secret %s/%s: %v", hostNamespace, secretName, err)
 			}
-			return false, err
+			return false, nil
 		}
 		return len(vcSecret.Data["config"]) > 0, nil
 	}); err != nil {
@@ -410,6 +434,24 @@ name = %s
 management-api = %s
 `, cfg.Project, cfg.Org, globalURL, encodedCA, cfg.Zone, mgmtURL)
 
+	// Deep-copy on each attempt (client.Create mutates the object in place) and
+	// treat AlreadyExists as idempotent success if an earlier attempt committed before
+	// a transient network drop.
+	createWithRetry := func(desc string, obj client.Object) {
+		var lastErr error
+		if err := wait.PollUntilContextTimeout(ctx, pollInterval, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+			createErr := hostClient.Create(ctx, obj.DeepCopyObject().(client.Object))
+			if createErr == nil || apierrors.IsAlreadyExists(createErr) {
+				return true, nil
+			}
+			lastErr = createErr
+			t.Logf("Transient error creating %s: %v", desc, createErr)
+			return false, nil
+		}); err != nil {
+			t.Fatalf("failed to create %s: %v (poll err: %v)", desc, lastErr, err)
+		}
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ccmConfigMapName,
@@ -419,9 +461,7 @@ management-api = %s
 			"cloudprovider.conf": cloudProviderConf,
 		},
 	}
-	if err := hostClient.Create(ctx, cm); err != nil {
-		t.Fatalf("failed to create ConfigMap %s: %v", ccmConfigMapName, err)
-	}
+	createWithRetry("ConfigMap "+ccmConfigMapName, cm)
 
 	saSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -433,9 +473,7 @@ management-api = %s
 			"serviceaccount.json": saBytes,
 		},
 	}
-	if err := hostClient.Create(ctx, saSecret); err != nil {
-		t.Fatalf("failed to create Secret %s: %v", ccmSASecretName, err)
-	}
+	createWithRetry("Secret "+ccmSASecretName, saSecret)
 
 	vcKubeconfigSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -447,9 +485,7 @@ management-api = %s
 			"kubeconfig": vclusterInClusterKubeconfig,
 		},
 	}
-	if err := hostClient.Create(ctx, vcKubeconfigSecret); err != nil {
-		t.Fatalf("failed to create Secret %s: %v", ccmVClusterSecretName, err)
-	}
+	createWithRetry("Secret "+ccmVClusterSecretName, vcKubeconfigSecret)
 
 	labels := map[string]string{
 		"app":  "kubernetes",
@@ -574,9 +610,7 @@ management-api = %s
 		},
 	}
 
-	if err := hostClient.Create(ctx, ccmDeployment); err != nil {
-		t.Fatalf("failed to create Deployment %s: %v", ccmAppName, err)
-	}
+	createWithRetry("Deployment "+ccmAppName, ccmDeployment)
 }
 
 func cleanupStaleCustomSubnets(ctx context.Context, t *testing.T, globalClient client.Client, project string) {
@@ -616,6 +650,12 @@ func dumpPodLogsOnFailure(ctx context.Context, t *testing.T, kubeconfigPath, nam
 		t.Logf("Failed to build rest config for log dumping: %v", err)
 		return
 	}
+	// Use a short dial timeout and retry listing Pods so diagnostic logs are still
+	// collected on test failure even when an ingress backend is intermittently dropping connections.
+	restConfig.Dial = (&net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
 	restConfig.Timeout = 10 * time.Second
 
 	clientset, err := kubernetesclientset.NewForConfig(restConfig)
@@ -624,7 +664,14 @@ func dumpPodLogsOnFailure(ctx context.Context, t *testing.T, kubeconfigPath, nam
 		return
 	}
 
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	var pods *corev1.PodList
+	for attempt := 1; attempt <= 3; attempt++ {
+		pods, err = clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
 	if err != nil {
 		t.Logf("Failed to list pods in namespace %q: %v", namespace, err)
 		return

@@ -69,7 +69,9 @@ func TestSTSToken(t *testing.T) {
 }
 
 func TestSTSToken_Failed(t *testing.T) {
+	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, mockResponse())
 	}))
@@ -79,11 +81,64 @@ func TestSTSToken_Failed(t *testing.T) {
 		tokenURI:       server.URL,
 		audience:       "audience",
 		jwtTokenSource: &mockJWTTokenSource{},
+		sleepFn:        func(time.Duration) {},
 	}
 
 	_, err := stsTS.Token()
 	if err == nil {
 		t.Fatal("got nil, expected error")
+	}
+	// Non-429 4xx responses represent permanent client errors and must fail fast without retrying.
+	if attempts != 1 {
+		t.Fatalf("expected non-retryable 400 response to stop after 1 attempt, got %d", attempts)
+	}
+}
+
+// TestSTSToken_RetriesTransientFailures verifies that Token() recovers across both
+// abrupt TCP connection resets (attempt 1) and HTTP 503 responses (attempt 2).
+func TestSTSToken_RetriesTransientFailures(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		switch attempts {
+		case 1:
+			// Simulate an upstream load-balancer connection reset mid-request.
+			hj, ok := w.(http.Hijacker)
+			if ok {
+				conn, _, err := hj.Hijack()
+				if err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+			w.WriteHeader(http.StatusBadGateway)
+		case 2:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, "upstream unavailable")
+		default:
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, mockResponse())
+		}
+	}))
+	defer server.Close()
+
+	stsTS := &stsTokenSource{
+		tokenURI:       server.URL,
+		audience:       "audience",
+		jwtTokenSource: &mockJWTTokenSource{},
+		clock:          clock.NewFakePassiveClock(testTimeNow),
+		sleepFn:        func(time.Duration) {},
+	}
+
+	got, err := stsTS.Token()
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got error: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+	if got.AccessToken != stsAccessToken {
+		t.Fatalf("expected token %q, got %q", stsAccessToken, got.AccessToken)
 	}
 }
 
