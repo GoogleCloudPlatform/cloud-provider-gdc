@@ -13,10 +13,10 @@ retry_cmd() {
       return 0
     fi
     if (( attempt >= max_attempts )); then
-      echo "::error::Command failed after ${max_attempts} attempts: $*"
+      echo "::error::Command failed after ${max_attempts} attempts: $*" >&2
       return 1
     fi
-    echo "Command failed (attempt ${attempt}/${max_attempts}): $*. Retrying in ${delay}s..."
+    echo "Command failed (attempt ${attempt}/${max_attempts}): $*. Retrying in ${delay}s..." >&2
     sleep "${delay}"
     attempt=$(( attempt + 1 ))
     delay=$(( delay * 2 ))
@@ -564,17 +564,29 @@ install_gdcloud_cli() {
     echo "::error::Failed to mint STS token using token-helper against ${mgmt_url}"
     exit 1
   fi
+  if [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${sts_token}" ]]; then
+    echo "::add-mask::${sts_token}"
+  fi
 
   echo "Resolving gdcloud CLI bundle URL (version: ${gdcloud_version}) from ${mgmt_url}..."
-  local clibundle_json serving_url
+  local auth_hdr_file clibundle_json serving_url
+  auth_hdr_file="$(mktemp /tmp/gdc-auth-hdr-XXXXXX)"
+  (
+    umask 077
+    printf 'Authorization: Bearer %s\n' "${sts_token}" > "${auth_hdr_file}"
+  )
   # Capture the curl response separately with --fail before piping to jq so HTTP/TCP
   # failures trigger retry_cmd instead of being masked by jq's exit status.
-  if ! clibundle_json=$(retry_cmd curl -ksSL --fail --connect-timeout 5 --max-time 25 \
-    -H "Authorization: Bearer ${sts_token}" \
+  # Listing CLIBundleMetadata on GDC staging routinely takes ~45-50s, so allow 120s
+  # for response transfer while keeping a fast 5s TCP connect timeout.
+  if ! clibundle_json=$(retry_cmd curl -ksSL --fail --connect-timeout 5 --max-time 120 \
+    -H "@${auth_hdr_file}" \
     "${mgmt_url}/apis/artifactview.private.gdc.goog/v1alpha1/namespaces/ui-system/clibundlemetadata"); then
+    rm -f "${auth_hdr_file}"
     echo "::error::Failed to query CLIBundleMetadata from ${mgmt_url}"
     exit 1
   fi
+  rm -f "${auth_hdr_file}"
   serving_url=$(printf '%s' "${clibundle_json}" | \
     jq -r --arg ver "${gdcloud_version}" '
       [.items[]
