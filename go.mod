@@ -36,7 +36,7 @@ require (
 
 require (
 	github.com/googlecloudplatform/google-distributed-cloud-apis v0.0.0-20260824201624-0c18fa0ddc04
-	gopkg.in/ini.v1 v1.67.3
+	gopkg.in/ini.v1 v1.68.0
 	helm.sh/helm/v3 v3.20.2
 	k8s.io/cli-runtime v0.35.10
 	k8s.io/cloud-provider v0.0.0-00010101000000-000000000000
