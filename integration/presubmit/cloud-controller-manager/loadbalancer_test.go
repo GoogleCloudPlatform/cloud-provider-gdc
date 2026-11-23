@@ -83,24 +83,52 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 		t.Logf("Verifying updated ports and HealthCheckNodePort (%d) on Global & Zonal UNET resources...", currentSvc.Spec.HealthCheckNodePort)
 		verifyExternalLBResources(ctx, t, env, currentSvc, lbName, elbVIP, nil, currentSvc.Spec.HealthCheckNodePort)
 
-		// 3. Convert External LoadBalancer (ELB) -> Internal LoadBalancer (ILB) in-place.
+		// 3. Configure loadBalancerSourceRanges on External LB and verify open-all PNP (<lbName>)
+		// is replaced by dedicated elb-cidr-<UID> and elb-proj-<UID>-<project> PNPs.
+		svcUID := string(currentSvc.UID)
+		sourceCIDRs := []string{"136.125.53.242/32", "137.83.231.70/32"}
+		t.Logf("Updating Service %s spec.loadBalancerSourceRanges=%v", svc.Name, sourceCIDRs)
+		currentSvc = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			s.Spec.LoadBalancerSourceRanges = sourceCIDRs
+		})
+		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: lbName}, &globalnetworkingv1.ProjectNetworkPolicy{})
+		verifyRestrictedExternalLBPNPs(ctx, t, env, currentSvc, []string{env.Project}, sourceCIDRs)
+
+		// 4. Switch to external-load-balancer-allow-projects without loadBalancerSourceRanges
+		// (customer-managed custom IPBlocks PNP mode) and verify elb-cidr-<UID> is pruned while
+		// per-project PNPs are reconciled.
+		secondaryProject := "platform"
+		t.Logf("Updating Service %s to clear loadBalancerSourceRanges and set %s=%q", svc.Name, externalLBAllowProjectsAnnotationKey, secondaryProject)
+		currentSvc = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
+			s.Spec.LoadBalancerSourceRanges = nil
+			if s.Annotations == nil {
+				s.Annotations = make(map[string]string)
+			}
+			s.Annotations[externalLBAllowProjectsAnnotationKey] = secondaryProject
+		})
+		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: fmt.Sprintf("elb-cidr-%s", svcUID)}, &globalnetworkingv1.ProjectNetworkPolicy{})
+		verifyRestrictedExternalLBPNPs(ctx, t, env, currentSvc, []string{env.Project, secondaryProject}, nil)
+
+		// 5. Convert External LoadBalancer (ELB) -> Internal LoadBalancer (ILB) in-place.
 		t.Logf("Converting Service %s from External LB to Internal LB", svc.Name)
 		_ = mutateServiceWithRetry(ctx, t, env.VClusterClient, client.ObjectKeyFromObject(svc), func(s *corev1.Service) {
 			if s.Annotations == nil {
 				s.Annotations = make(map[string]string)
 			}
+			delete(s.Annotations, externalLBAllowProjectsAnnotationKey)
 			s.Annotations[lbTypeAnnotationKey] = lbTypeInternal
 		})
 
 		ilbVIP, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, elbVIP)
 		t.Logf("Service %s converted from ELB VIP %s to ILB VIP %s", svc.Name, elbVIP, ilbVIP)
 
-		// Verify ForwardingRuleExternal and open-all PNP are deleted, and ForwardingRuleInternal + project PNP exist.
+		// Verify ForwardingRuleExternal and restricted ELB PNPs are deleted, and ForwardingRuleInternal + project PNP exist.
 		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: lbName + fwdRuleSuffix}, &globalnetworkingv1.ForwardingRuleExternal{})
-		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: lbName}, &globalnetworkingv1.ProjectNetworkPolicy{})
+		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: fmt.Sprintf("elb-proj-%s-%s", svcUID, env.Project)}, &globalnetworkingv1.ProjectNetworkPolicy{})
+		waitForObjectDeleted(ctx, t, env.GlobalClient, client.ObjectKey{Namespace: env.Project, Name: fmt.Sprintf("elb-proj-%s-%s", svcUID, secondaryProject)}, &globalnetworkingv1.ProjectNetworkPolicy{})
 		verifyInternalLBResources(ctx, t, env, currentSvc, lbName, ilbVIP, nil, currentSvc.Spec.HealthCheckNodePort, []string{env.Project}, false)
 
-		// 4. Delete Service and verify all Global & Zonal UNET resources are cleaned up.
+		// 6. Delete Service and verify all Global & Zonal UNET resources are cleaned up.
 		t.Logf("Deleting Service %s and verifying complete Global & Zonal UNET resource cleanup", svc.Name)
 		deleteServiceAndWait(ctx, t, env.VClusterClient, svc.Namespace, svc.Name)
 		verifyAllLBResourcesDeleted(ctx, t, env, string(currentSvc.UID), lbName)
@@ -551,6 +579,77 @@ func verifyExternalLBResources(
 		return meta.IsStatusConditionTrue(zonalPNP.Status.Conditions, "Ready"), nil
 	}); err != nil {
 		t.Fatalf("Global/Zonal Open-All ProjectNetworkPolicy %s/%s verification failed: %v", env.Project, lbName, err)
+	}
+}
+
+func verifyRestrictedExternalLBPNPs(
+	ctx context.Context,
+	t *testing.T,
+	env *TestEnv,
+	svc *corev1.Service,
+	expectedAllowedProjects []string,
+	expectedSourceCIDRs []string,
+) {
+	t.Helper()
+	svcUID := string(svc.UID)
+
+	for _, allowedProj := range expectedAllowedProjects {
+		pnpName := fmt.Sprintf("elb-proj-%s-%s", svcUID, allowedProj)
+		if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
+			pnp := &globalnetworkingv1.ProjectNetworkPolicy{}
+			if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: pnpName}, pnp); err != nil {
+				return retryableGetErr(t, "Global ProjectNetworkPolicy "+pnpName, err)
+			}
+			if pnp.Labels[pnpLabelServiceUID] != svcUID || pnp.Labels[ilbPnpLabelAllowedProject] != allowedProj {
+				return false, nil
+			}
+			if len(pnp.Spec.Ingress) != 1 || len(pnp.Spec.Ingress[0].From) != 1 || pnp.Spec.Ingress[0].From[0].Projects == nil {
+				return false, nil
+			}
+			matchNames := pnp.Spec.Ingress[0].From[0].Projects.MatchNames
+			if len(matchNames) != 1 || matchNames[0] != allowedProj || len(pnp.Spec.Ingress[0].Ports) != len(svc.Spec.Ports) {
+				return false, nil
+			}
+			zonalPNP := &networkingv1.ProjectNetworkPolicy{}
+			if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: pnpName}, zonalPNP); err != nil {
+				return retryableGetErr(t, "Zonal ProjectNetworkPolicy "+pnpName, err)
+			}
+			return meta.IsStatusConditionTrue(zonalPNP.Status.Conditions, "Ready"), nil
+		}); err != nil {
+			t.Fatalf("Project-scoped ELB ProjectNetworkPolicy %s/%s verification failed: %v", env.Project, pnpName, err)
+		}
+	}
+
+	if len(expectedSourceCIDRs) > 0 {
+		cidrPNPName := fmt.Sprintf("elb-cidr-%s", svcUID)
+		if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
+			pnp := &globalnetworkingv1.ProjectNetworkPolicy{}
+			if err := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: cidrPNPName}, pnp); err != nil {
+				return retryableGetErr(t, "Global ProjectNetworkPolicy "+cidrPNPName, err)
+			}
+			if pnp.Labels[pnpLabelServiceUID] != svcUID {
+				return false, nil
+			}
+			if len(pnp.Spec.Ingress) != 1 || len(pnp.Spec.Ingress[0].From) != 1 || len(pnp.Spec.Ingress[0].Ports) != len(svc.Spec.Ports) {
+				return false, nil
+			}
+			ipBlocks := pnp.Spec.Ingress[0].From[0].IPBlocks
+			if len(ipBlocks) != len(expectedSourceCIDRs) {
+				return false, nil
+			}
+			for i, wantCIDR := range expectedSourceCIDRs {
+				if ipBlocks[i].CIDR != wantCIDR {
+					return false, nil
+				}
+			}
+			zonalPNP := &networkingv1.ProjectNetworkPolicy{}
+			if err := env.MgmtClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: cidrPNPName}, zonalPNP); err != nil {
+				return retryableGetErr(t, "Zonal ProjectNetworkPolicy "+cidrPNPName, err)
+			}
+			return meta.IsStatusConditionTrue(zonalPNP.Status.Conditions, "Ready"), nil
+		}); err != nil {
+			t.Fatalf("CIDR-scoped ELB ProjectNetworkPolicy %s/%s verification failed: %v", env.Project, cidrPNPName, err)
+		}
 	}
 }
 

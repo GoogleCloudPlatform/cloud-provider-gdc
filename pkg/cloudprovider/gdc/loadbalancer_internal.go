@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -455,14 +456,8 @@ func (g *lb) updateSubnetOwnerReference(ctx context.Context, subnetKey client.Ob
 
 func (g *lb) deleteProjectNetworkPolicies(ctx context.Context, projectNs string, pnpNamesToDelete []string) error {
 	for _, name := range pnpNamesToDelete {
-		pnp := &globalnetworkingv1.ProjectNetworkPolicy{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: projectNs,
-			},
-		}
-		if err := g.globalMPClient.Delete(ctx, pnp); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("delete PNP %s: %w", name, err)
+		if err := g.deleteProjectNetworkPolicy(ctx, name, projectNs); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -480,8 +475,10 @@ func (g *lb) listProjectNetworkPolicies(ctx context.Context, projectNs, serviceU
 		return nil, err
 	}
 
+	seen := make(map[string]struct{}, len(existingPNPs.Items)+1)
 	pnpNames := make([]string, 0, len(existingPNPs.Items))
 	for _, item := range existingPNPs.Items {
+		seen[item.Name] = struct{}{}
 		pnpNames = append(pnpNames, item.Name)
 	}
 
@@ -489,8 +486,10 @@ func (g *lb) listProjectNetworkPolicies(ctx context.Context, projectNs, serviceU
 	legacyPNP := &globalnetworkingv1.ProjectNetworkPolicy{}
 	err = g.globalMPClient.Get(ctx, types.NamespacedName{Namespace: projectNs, Name: lbName}, legacyPNP)
 	if err == nil {
-		klog.Infof("listProjectNetworkPolicies: found legacy PNP %s", lbName)
-		pnpNames = append(pnpNames, legacyPNP.Name)
+		if _, exists := seen[legacyPNP.Name]; !exists {
+			klog.Infof("listProjectNetworkPolicies: found legacy PNP %s", lbName)
+			pnpNames = append(pnpNames, legacyPNP.Name)
+		}
 	} else if !errors.IsNotFound(err) {
 		return nil, err
 	}
@@ -525,9 +524,10 @@ func (g *lb) getAllowedProjects(allowProjectsVal string) []string {
 		}
 	}
 
-	var allowedProjects []string
+	allowedProjects := make([]string, 0, len(allowedProjectsMap))
 	for p := range allowedProjectsMap {
 		allowedProjects = append(allowedProjects, p)
 	}
+	slices.Sort(allowedProjects)
 	return allowedProjects
 }

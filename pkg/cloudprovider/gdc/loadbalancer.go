@@ -18,8 +18,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -28,6 +31,7 @@ const (
 	internalLBSubnetAnnotationKey        = "networking.gke.io/load-balancer-subnet"
 	externalLBIPAddressesAnnotationKey   = "networking.gke.io/load-balancer-ip-addresses"
 	internalLBAllowProjectsAnnotationKey = "networking.gke.io/load-balancer-allow-projects"
+	externalLBAllowProjectsAnnotationKey = "networking.gke.io/external-load-balancer-allow-projects"
 
 	// Annotation Values
 	lbInternal = "internal"
@@ -45,6 +49,8 @@ const (
 	pnpLabelServiceUID        = "networking.gke.io/load-balancer-service-uid"
 	ilbPnpLabelAllowedProject = "networking.gke.io/load-balancer-allowed-project"
 	ilbPnpNamePrefix          = "ilb"
+	elbProjectPnpNamePrefix   = "elb-proj"
+	elbCIDRPnpNamePrefix      = "elb-cidr"
 )
 
 // GetLoadBalancerName returns the name of the load balancer.
@@ -84,6 +90,10 @@ func (g *lb) EnsureLoadBalancer(ctx context.Context, clusterName string, service
 		return nil, fmt.Errorf("validateServicePorts %q/%q for service %q:%w", lbNamespace, lbName, service.Name, err)
 	}
 
+	if err := validateServiceSourceAccess(service, desiredType); err != nil {
+		return nil, fmt.Errorf("validateServiceSourceAccess %q/%q for service %q:%w", lbNamespace, lbName, service.Name, err)
+	}
+
 	// Delete the LB of the other type if it exists and create the LB of the desiredType if it does not exist
 	switch desiredType {
 	case lbInternal:
@@ -113,6 +123,10 @@ func (g *lb) UpdateLoadBalancer(ctx context.Context, clusterName string, service
 
 	if err := validateServicePorts(service); err != nil {
 		return fmt.Errorf("validateServicePorts %q/%q for service %q:%w", lbNamespace, lbName, service.Name, err)
+	}
+
+	if err := validateServiceSourceAccess(service, svcType); err != nil {
+		return fmt.Errorf("validateServiceSourceAccess %q/%q for service %q:%w", lbNamespace, lbName, service.Name, err)
 	}
 
 	switch svcType {
@@ -212,4 +226,99 @@ func validateServicePorts(service *v1.Service) error {
 		}
 	}
 	return nil
+}
+
+func validateServiceSourceAccess(svc *v1.Service, svcType string) error {
+	_, internalAllowProjectsOk := svc.Annotations[internalLBAllowProjectsAnnotationKey]
+	externalAllowProjectsVal, externalAllowProjectsOk := svc.Annotations[externalLBAllowProjectsAnnotationKey]
+
+	switch svcType {
+	case lbInternal:
+		if externalAllowProjectsOk {
+			return fmt.Errorf("internal LB service %q/%q must not have external allow-projects annotation %q; use %q",
+				svc.Namespace, svc.Name, externalLBAllowProjectsAnnotationKey, internalLBAllowProjectsAnnotationKey)
+		}
+		// Intentionally do not reject loadBalancerSourceRanges on Internal LBs so
+		// existing manifests or in-place External -> Internal conversions remain
+		// non-breaking; CIDR source ranges are only reconciled for External LBs.
+		return nil
+
+	default:
+		if internalAllowProjectsOk {
+			return fmt.Errorf("external LB service %q/%q must not have internal allow-projects annotation %q; use %q",
+				svc.Namespace, svc.Name, internalLBAllowProjectsAnnotationKey, externalLBAllowProjectsAnnotationKey)
+		}
+		if externalAllowProjectsOk {
+			if err := validateExternalAllowedProjects(svc, externalAllowProjectsVal); err != nil {
+				return err
+			}
+		}
+		if _, err := extractLoadBalancerSourceRanges(svc); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
+func validateExternalAllowedProjects(svc *v1.Service, allowProjectsVal string) error {
+	// An empty value is explicitly valid on External LBs and scopes the auto-generated
+	// ProjectNetworkPolicy strictly to the cluster's own project (without requiring
+	// callers inside the cluster to hardcode the GDC project name).
+	if strings.TrimSpace(allowProjectsVal) == "" {
+		return nil
+	}
+
+	for _, p := range strings.Split(allowProjectsVal, ",") {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			return fmt.Errorf("external LB service %q/%q annotation %q contains empty project name",
+				svc.Namespace, svc.Name, externalLBAllowProjectsAnnotationKey)
+		}
+		if trimmed == "*" {
+			return fmt.Errorf("external LB service %q/%q annotation %q does not support wildcard \"*\"; omit %q and loadBalancerSourceRanges to allow all traffic, or specify explicit project names",
+				svc.Namespace, svc.Name, externalLBAllowProjectsAnnotationKey, externalLBAllowProjectsAnnotationKey)
+		}
+		if errs := validation.IsDNS1035Label(trimmed); len(errs) > 0 {
+			return fmt.Errorf("external LB service %q/%q annotation %q contains invalid project name %q: %v",
+				svc.Namespace, svc.Name, externalLBAllowProjectsAnnotationKey, trimmed, errs)
+		}
+	}
+	return nil
+}
+
+// extractLoadBalancerSourceRanges returns canonical, deduplicated, sorted CIDR strings
+// from service.Spec.LoadBalancerSourceRanges (falling back to the standard Kubernetes
+// service.beta.kubernetes.io/load-balancer-source-ranges annotation when Spec is unset).
+func extractLoadBalancerSourceRanges(svc *v1.Service) ([]string, error) {
+	var rawRanges []string
+	if len(svc.Spec.LoadBalancerSourceRanges) > 0 {
+		rawRanges = svc.Spec.LoadBalancerSourceRanges
+	} else if rawAnnotation, ok := svc.Annotations[v1.AnnotationLoadBalancerSourceRangesKey]; ok && strings.TrimSpace(rawAnnotation) != "" {
+		rawRanges = strings.Split(rawAnnotation, ",")
+	}
+	if len(rawRanges) == 0 {
+		return nil, nil
+	}
+
+	cidrSet := make(map[string]struct{}, len(rawRanges))
+	for _, raw := range rawRanges {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return nil, fmt.Errorf("external LB service %q/%q contains empty CIDR in loadBalancerSourceRanges",
+				svc.Namespace, svc.Name)
+		}
+		_, ipNet, err := net.ParseCIDR(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("external LB service %q/%q contains invalid CIDR %q in loadBalancerSourceRanges: %w",
+				svc.Namespace, svc.Name, trimmed, err)
+		}
+		cidrSet[ipNet.String()] = struct{}{}
+	}
+
+	cidrs := make([]string, 0, len(cidrSet))
+	for cidr := range cidrSet {
+		cidrs = append(cidrs, cidr)
+	}
+	slices.Sort(cidrs)
+	return cidrs, nil
 }
