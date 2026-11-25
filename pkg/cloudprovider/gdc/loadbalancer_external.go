@@ -21,6 +21,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	k8snetworkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -86,9 +87,8 @@ func (g *lb) ensureExternalLoadBalancer(ctx context.Context, clusterName string,
 		return nil, api.NewRetryError(msg, 10*time.Second)
 	}
 
-	// create or update PNP for the successfully created LB service
-	desiredPNPPorts := servicePortToPnpPorts(service.Spec.Ports)
-	if err := g.createOrUpdateOpenAllProjectNetworkPolicy(ctx, name, namespace, clusterName, service, desiredPNPPorts); err != nil {
+	// create or update PNPs for the successfully created LB service
+	if err := g.createOrUpdateExternalProjectNetworkPolicies(ctx, name, namespace, clusterName, service); err != nil {
 		msg := fmt.Sprintf("EnsureLoadBalancer: GDC service %q for shoot service %q has pnp error %q", name, service.Name, err)
 		return nil, api.NewRetryError(msg, 10*time.Second)
 	}
@@ -153,8 +153,13 @@ func (g *lb) ensureExternalLoadBalancerDeleted(ctx context.Context, clusterName 
 		return api.NewRetryError(msg, 10*time.Second)
 	}
 
-	if err = g.deleteProjectNetworkPolicy(ctx, name, namespace); err != nil && !errors.IsNotFound(err) {
-		msg := fmt.Sprintf("deleteProjectNetworkPolicy error for %q/%q LB for service %q - %v", namespace, name, service.Name, err)
+	if pnpNamesToDelete, err := g.listProjectNetworkPolicies(ctx, namespace, string(service.UID), name); err == nil {
+		if err = g.deleteProjectNetworkPolicies(ctx, namespace, pnpNamesToDelete); err != nil && !errors.IsNotFound(err) {
+			msg := fmt.Sprintf("deleteProjectNetworkPolicy error for %q/%q LB for service %q - %v", namespace, name, service.Name, err)
+			return api.NewRetryError(msg, 10*time.Second)
+		}
+	} else if !errors.IsNotFound(err) {
+		msg := fmt.Sprintf("listProjectNetworkPolicies error for %q/%q LB for service %q - %v", namespace, name, service.Name, err)
 		return api.NewRetryError(msg, 10*time.Second)
 	}
 
@@ -198,9 +203,8 @@ func (g *lb) updateExternalLoadBalancer(ctx context.Context, clusterName string,
 		return fmt.Errorf("ELB service %q error - %v", service.Name, err)
 	}
 
-	// create or update PNP for the successfully created LB service
-	desiredPNPPorts := servicePortToPnpPorts(service.Spec.Ports)
-	if err := g.createOrUpdateOpenAllProjectNetworkPolicy(ctx, name, namespace, clusterName, service, desiredPNPPorts); err != nil {
+	// create or update PNPs for the successfully created LB service
+	if err := g.createOrUpdateExternalProjectNetworkPolicies(ctx, name, namespace, clusterName, service); err != nil {
 		return err
 	}
 
@@ -247,6 +251,155 @@ func (g *lb) createOrUpdateExtFwdRule(ctx context.Context, name, namespace strin
 		}
 	}
 	return fmt.Errorf("createOrUpdateExtFwdRule retryable error: recreating ForwardingRuleExternal due to CIDRRef change")
+}
+
+// createOrUpdateExternalProjectNetworkPolicies reconciles ProjectNetworkPolicies for an
+// External LoadBalancer service:
+//   - Unrestricted (default, non-breaking): when neither loadBalancerSourceRanges nor
+//     networking.gke.io/external-load-balancer-allow-projects is configured, it maintains
+//     the single open-all PNP (<lbName>) with an empty From selector.
+//   - Restricted: when loadBalancerSourceRanges and/or external-load-balancer-allow-projects
+//     is configured, it creates one single-project PNP per allowed internal project
+//     (always including g.project, compatible with GDC 1.16.2's single-project matchNames
+//     limit) plus a dedicated IPBlocks PNP when loadBalancerSourceRanges are specified,
+//     and prunes the open-all <lbName> PNP and any stale PNPs.
+func (g *lb) createOrUpdateExternalProjectNetworkPolicies(ctx context.Context, lbName, projectNs, clusterName string, service *v1.Service) error {
+	desiredPNPPorts := servicePortToPnpPorts(service.Spec.Ports)
+	sourceCIDRs, err := extractLoadBalancerSourceRanges(service)
+	if err != nil {
+		return err
+	}
+
+	allowProjectsVal, hasAllowProjectsAnnotation := service.Annotations[externalLBAllowProjectsAnnotationKey]
+	serviceUID := string(service.UID)
+	currentPNPNames := make(map[string]struct{})
+
+	if len(sourceCIDRs) == 0 && !hasAllowProjectsAnnotation {
+		if err := g.createOrUpdateOpenAllProjectNetworkPolicy(ctx, lbName, projectNs, clusterName, service, desiredPNPPorts); err != nil {
+			return err
+		}
+		currentPNPNames[lbName] = struct{}{}
+	} else {
+		projects := g.getAllowedProjects(allowProjectsVal)
+		klog.Infof("createOrUpdateExternalProjectNetworkPolicies: desired projects for service %s/%s: %v, sourceCIDRs: %v",
+			service.Namespace, service.Name, projects, sourceCIDRs)
+
+		for _, project := range projects {
+			pnpName, err := getExternalProjectNetworkPolicyName(serviceUID, project)
+			if err != nil {
+				return err
+			}
+			if err := g.ensureProjectNetworkPolicy(ctx, pnpName, projectNs, clusterName, service, project); err != nil {
+				return err
+			}
+			currentPNPNames[pnpName] = struct{}{}
+		}
+
+		if len(sourceCIDRs) > 0 {
+			cidrPNPName, err := getExternalCIDRProjectNetworkPolicyName(serviceUID)
+			if err != nil {
+				return err
+			}
+			if err := g.ensureCIDRProjectNetworkPolicy(ctx, cidrPNPName, projectNs, clusterName, service, desiredPNPPorts, sourceCIDRs); err != nil {
+				return err
+			}
+			currentPNPNames[cidrPNPName] = struct{}{}
+		}
+	}
+
+	existingPNPNames, err := g.listProjectNetworkPolicies(ctx, projectNs, serviceUID, lbName)
+	if err != nil {
+		return fmt.Errorf("list existing PNPs for deletion: %w", err)
+	}
+
+	var pnpNamesToDelete []string
+	for _, existingName := range existingPNPNames {
+		if _, ok := currentPNPNames[existingName]; !ok {
+			pnpNamesToDelete = append(pnpNamesToDelete, existingName)
+		}
+	}
+
+	return g.deleteProjectNetworkPolicies(ctx, projectNs, pnpNamesToDelete)
+}
+
+func (g *lb) ensureCIDRProjectNetworkPolicy(
+	ctx context.Context,
+	pnpName, projectNs, clusterName string,
+	service *v1.Service,
+	desiredPNPPorts []networkingv1.ProjectNetworkPolicyPort,
+	sourceCIDRs []string,
+) error {
+	serviceUID := string(service.UID)
+	ipBlocks := make([]k8snetworkingv1.IPBlock, 0, len(sourceCIDRs))
+	for _, cidr := range sourceCIDRs {
+		ipBlocks = append(ipBlocks, k8snetworkingv1.IPBlock{
+			CIDR: cidr,
+		})
+	}
+
+	updatedPNP := &globalnetworkingv1.ProjectNetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pnpName,
+			Namespace: projectNs,
+		},
+	}
+
+	mutateFn := func() error {
+		if updatedPNP.Labels == nil {
+			updatedPNP.Labels = make(map[string]string)
+		}
+		updatedPNP.Labels[pnpLabelServiceUID] = serviceUID
+		delete(updatedPNP.Labels, ilbPnpLabelAllowedProject)
+
+		updatedPNP.Spec = networkingv1.ProjectNetworkPolicySpec{
+			Subject: networkingv1.ProjectNetworkPolicySubject{
+				SubjectType: networkingv1.PolicySubjectTypeUserWorkload,
+				UserWorkloadSelector: &networkingv1.WorkloadSelector{
+					LabelSelector: &networkingv1.WorkloadLabelSelector{
+						Workloads: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								lbSelectorLabel: clusterName,
+							},
+						},
+					},
+				},
+			},
+			PolicyType: networkingv1.PolicyTypeIngress,
+			Ingress: []networkingv1.ProjectNetworkPolicyIngressRule{
+				{
+					Ports: desiredPNPPorts,
+					From: []networkingv1.ProjectNetworkPolicyPeer{
+						{
+							IPBlocks: ipBlocks,
+						},
+					},
+				},
+			},
+		}
+		return nil
+	}
+
+	klog.Infof("ensureCIDRProjectNetworkPolicy: creating/updating PNP %s", pnpName)
+	if _, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, updatedPNP, mutateFn); err != nil {
+		return fmt.Errorf("ensureCIDRProjectNetworkPolicy %s: %w", client.ObjectKeyFromObject(updatedPNP), err)
+	}
+	return nil
+}
+
+func getExternalProjectNetworkPolicyName(serviceUID, project string) (string, error) {
+	pnpName := fmt.Sprintf("%s-%s-%s", elbProjectPnpNamePrefix, serviceUID, project)
+	if len(pnpName) > 200 {
+		return "", fmt.Errorf("generated ProjectNetworkPolicy name %q exceeds 200 characters", pnpName)
+	}
+	return pnpName, nil
+}
+
+func getExternalCIDRProjectNetworkPolicyName(serviceUID string) (string, error) {
+	pnpName := fmt.Sprintf("%s-%s", elbCIDRPnpNamePrefix, serviceUID)
+	if len(pnpName) > 200 {
+		return "", fmt.Errorf("generated ProjectNetworkPolicy name %q exceeds 200 characters", pnpName)
+	}
+	return pnpName, nil
 }
 
 // g.createOrUpdateOpenAllProjectNetworkPolicy creates an ingress "OpenAll" policy to allow ingress from any projects and all CIDR blocks

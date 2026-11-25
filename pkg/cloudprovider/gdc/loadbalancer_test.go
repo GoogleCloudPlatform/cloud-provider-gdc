@@ -24,6 +24,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "k8s.io/api/core/v1"
+	k8snetworkingv1 "k8s.io/api/networking/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1056,6 +1057,205 @@ func TestEnsureLoadBalancer(t *testing.T) {
 				return objs
 			}(),
 		},
+		{
+			name: "External Service with loadBalancerSourceRanges creates CIDR and own-project PNPs without open-all PNP",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Spec.LoadBalancerSourceRanges = []string{
+					"137.83.231.70/32",
+					"10.20.30.5/24",
+					"137.83.231.70/32",
+				}
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      false,
+			wantGlobalObjs: func() []client.Object {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"10.20.30.0/24", "137.83.231.70/32"})
+				return []client.Object{
+					extGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleExternal),
+					nil,
+					extGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+					extGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+					extGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+					pnpSelf,
+					pnpCIDR,
+					nil,
+				}
+			}(),
+			wantZonalObjs: []client.Object{
+				extZonalObjs[backendIndex].(*networkingv1.Backend),
+			},
+		},
+		{
+			name: "External Service with legacy source-ranges annotation creates CIDR and own-project PNPs",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[v1.AnnotationLoadBalancerSourceRangesKey] = "136.125.53.242/32, 134.238.84.48/32"
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      false,
+			wantGlobalObjs: func() []client.Object {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"134.238.84.48/32", "136.125.53.242/32"})
+				return []client.Object{
+					extGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleExternal),
+					nil,
+					extGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+					extGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+					extGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+					pnpSelf,
+					pnpCIDR,
+					nil,
+				}
+			}(),
+			wantZonalObjs: []client.Object{
+				extZonalObjs[backendIndex].(*networkingv1.Backend),
+			},
+		},
+		{
+			name: "External Service with empty external-load-balancer-allow-projects scopes PNP to own project only",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[externalLBAllowProjectsAnnotationKey] = ""
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      false,
+			wantGlobalObjs: func() []client.Object {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				return []client.Object{
+					extGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleExternal),
+					nil,
+					extGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+					extGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+					extGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+					pnpSelf,
+					nil,
+				}
+			}(),
+			wantZonalObjs: []client.Object{
+				extZonalObjs[backendIndex].(*networkingv1.Backend),
+			},
+		},
+		{
+			name: "External Service with explicit external-load-balancer-allow-projects and loadBalancerSourceRanges",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[externalLBAllowProjectsAnnotationKey] = "proj1,proj2"
+				svc.Spec.LoadBalancerSourceRanges = []string{"137.83.231.70/32"}
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      false,
+			wantGlobalObjs: func() []client.Object {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpProj1 := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, "proj1", ports)
+				pnpProj2 := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, "proj2", ports)
+				pnpCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"137.83.231.70/32"})
+				return []client.Object{
+					extGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleExternal),
+					nil,
+					extGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+					extGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+					extGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+					pnpSelf,
+					pnpProj1,
+					pnpProj2,
+					pnpCIDR,
+					nil,
+				}
+			}(),
+			wantZonalObjs: []client.Object{
+				extZonalObjs[backendIndex].(*networkingv1.Backend),
+			},
+		},
+		{
+			name:    "Internal Service - Restricted External LB already exists - prunes all elb-* PNPs",
+			service: validInternalService,
+			globalClient: func() client.Client {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpElbSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpElbCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"137.83.231.70/32"})
+				objs := []client.Object{
+					extGlobalObjs[forwardingRuleIndex],
+					extGlobalObjs[backendServiceIndex],
+					extGlobalObjs[backendServicePolicyIndex],
+					extGlobalObjs[healthCheckIndex],
+					pnpElbSelf,
+					pnpElbCIDR,
+				}
+				return initFakeClient(globalScheme, objs...)
+			}(),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme, extZonalObjs...)},
+			wantErr:      false,
+			wantGlobalObjs: []client.Object{
+				nil,
+				intGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleInternal),
+				intGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+				intGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+				intGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+				intGlobalObjs[pnpIndex].(*globalnetworkingv1.ProjectNetworkPolicy),
+				nil,
+			},
+			wantZonalObjs: []client.Object{
+				intZonalObjs[backendIndex].(*networkingv1.Backend),
+			},
+		},
+		{
+			name: "External Service with wildcard external-load-balancer-allow-projects returns error",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[externalLBAllowProjectsAnnotationKey] = "*"
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      true,
+		},
+		{
+			name: "External Service with invalid CIDR in loadBalancerSourceRanges returns error",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Spec.LoadBalancerSourceRanges = []string{"not-a-cidr"}
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      true,
+		},
+		{
+			name: "External Service with internal allow-projects annotation returns error",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[internalLBAllowProjectsAnnotationKey] = "proj1"
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      true,
+		},
+		{
+			name: "Internal Service with external allow-projects annotation returns error",
+			service: func() *v1.Service {
+				svc := validInternalService.DeepCopy()
+				svc.Annotations[externalLBAllowProjectsAnnotationKey] = "proj1"
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme)},
+			wantErr:      true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1544,6 +1744,110 @@ func TestUpdateLoadBalancer(t *testing.T) {
 			wantZonalObjs: intZonalObjs,
 			wantErr:       nil,
 		},
+		{
+			name: "External Service - Transition from OpenAll PNP to Restricted CIDR and project PNPs",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[externalLBAllowProjectsAnnotationKey] = "proj1"
+				svc.Spec.LoadBalancerSourceRanges = []string{"137.83.231.70/32"}
+				return svc
+			}(),
+			globalClient: initFakeClient(globalScheme, extGlobalObjs...),
+			zonalClients: map[string]client.Client{
+				zone: initFakeClient(zonalScheme, extZonalObjs...),
+			},
+			wantGlobalObjs: func() []client.Object {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpProj1 := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, "proj1", ports)
+				pnpCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"137.83.231.70/32"})
+				return []client.Object{
+					extGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleExternal),
+					nil,
+					extGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+					extGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+					extGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+					pnpSelf,
+					pnpProj1,
+					pnpCIDR,
+					nil,
+				}
+			}(),
+			wantZonalObjs: extZonalObjs,
+			wantErr:       nil,
+		},
+		{
+			name: "External Service - Update restricted PNPs (remove CIDR and proj1, keep proj2)",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[externalLBAllowProjectsAnnotationKey] = "proj2"
+				return svc
+			}(),
+			globalClient: func() client.Client {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpProj1 := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, "proj1", ports)
+				pnpProj2 := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, "proj2", ports)
+				pnpCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"137.83.231.70/32"})
+				return initFakeClient(globalScheme,
+					extGlobalObjs[forwardingRuleIndex],
+					extGlobalObjs[backendServiceIndex],
+					extGlobalObjs[backendServicePolicyIndex],
+					extGlobalObjs[healthCheckIndex],
+					pnpSelf, pnpProj1, pnpProj2, pnpCIDR,
+				)
+			}(),
+			zonalClients: map[string]client.Client{
+				zone: initFakeClient(zonalScheme, extZonalObjs...),
+			},
+			wantGlobalObjs: func() []client.Object {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpProj2 := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, "proj2", ports)
+				return []client.Object{
+					extGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleExternal),
+					nil,
+					extGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+					extGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+					extGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+					pnpSelf,
+					pnpProj2,
+					nil,
+				}
+			}(),
+			wantZonalObjs: extZonalObjs,
+			wantErr:       nil,
+		},
+		{
+			name:    "External Service - Transition from Restricted PNPs back to OpenAll PNP",
+			service: validExternalService,
+			globalClient: func() client.Client {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"137.83.231.70/32"})
+				return initFakeClient(globalScheme,
+					extGlobalObjs[forwardingRuleIndex],
+					extGlobalObjs[backendServiceIndex],
+					extGlobalObjs[backendServicePolicyIndex],
+					extGlobalObjs[healthCheckIndex],
+					pnpSelf, pnpCIDR,
+				)
+			}(),
+			zonalClients: map[string]client.Client{
+				zone: initFakeClient(zonalScheme, extZonalObjs...),
+			},
+			wantGlobalObjs: []client.Object{
+				extGlobalObjs[forwardingRuleIndex].(*globalnetworkingv1.ForwardingRuleExternal),
+				nil,
+				extGlobalObjs[backendServiceIndex].(*globalnetworkingv1.BackendService),
+				extGlobalObjs[backendServicePolicyIndex].(*globalnetworkingv1.BackendServicePolicy),
+				extGlobalObjs[healthCheckIndex].(*globalnetworkingv1.HealthCheck),
+				extGlobalObjs[pnpIndex].(*globalnetworkingv1.ProjectNetworkPolicy),
+				nil,
+			},
+			wantZonalObjs: extZonalObjs,
+			wantErr:       nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1697,6 +2001,36 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
 			},
 			wantGlobalObjs: []client.Object{
 				nil, nil, nil, nil, nil, nil, nil,
+			},
+			wantZonalObjs: []client.Object{
+				nil,
+			},
+			wantErr: nil,
+		},
+		{
+			name: "Restricted External Service (even with invalid CIDR typo) - deletes all elb-* PNPs cleanly without blocking finalizer",
+			service: func() *v1.Service {
+				svc := validExternalService.DeepCopy()
+				svc.Annotations[externalLBAllowProjectsAnnotationKey] = "proj1"
+				svc.Spec.LoadBalancerSourceRanges = []string{"invalid-cidr"}
+				return svc
+			}(),
+			globalClient: func() client.Client {
+				ports := servicePortToPnpPorts(validExternalService.Spec.Ports)
+				pnpSelf := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, lbNamespace, ports)
+				pnpProj1 := createExpectedExternalProjectPNP(lbNamespace, clusterName, shootUUID, "proj1", ports)
+				pnpCIDR := createExpectedExternalCIDRPNP(lbNamespace, clusterName, shootUUID, ports, []string{"137.83.231.70/32"})
+				return initFakeClient(globalScheme,
+					extGlobalObjs[forwardingRuleIndex],
+					extGlobalObjs[backendServiceIndex],
+					extGlobalObjs[backendServicePolicyIndex],
+					extGlobalObjs[healthCheckIndex],
+					pnpSelf, pnpProj1, pnpCIDR,
+				)
+			}(),
+			zonalClients: map[string]client.Client{zone: initFakeClient(zonalScheme, extZonalObjs...)},
+			wantGlobalObjs: []client.Object{
+				nil, nil, nil, nil, nil, nil,
 			},
 			wantZonalObjs: []client.Object{
 				nil,
@@ -2967,4 +3301,237 @@ func createExpectedPNP(baseName, namespace, clusterName, serviceUID, project str
 		}
 	}
 	return pnp
+}
+
+func createExpectedExternalProjectPNP(namespace, clusterName, serviceUID, project string, ports []networkingv1.ProjectNetworkPolicyPort) *globalnetworkingv1.ProjectNetworkPolicy {
+	pnpName, _ := getExternalProjectNetworkPolicyName(serviceUID, project)
+	return &globalnetworkingv1.ProjectNetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pnpName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				pnpLabelServiceUID:        serviceUID,
+				ilbPnpLabelAllowedProject: project,
+			},
+		},
+		Spec: networkingv1.ProjectNetworkPolicySpec{
+			Subject: networkingv1.ProjectNetworkPolicySubject{
+				SubjectType: networkingv1.PolicySubjectTypeUserWorkload,
+				UserWorkloadSelector: &networkingv1.WorkloadSelector{
+					LabelSelector: &networkingv1.WorkloadLabelSelector{
+						Workloads: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								lbSelectorLabel: clusterName,
+							},
+						},
+					},
+				},
+			},
+			PolicyType: networkingv1.PolicyTypeIngress,
+			Ingress: []networkingv1.ProjectNetworkPolicyIngressRule{
+				{
+					Ports: ports,
+					From: []networkingv1.ProjectNetworkPolicyPeer{
+						{
+							Projects: &networkingv1.PolicyProjects{
+								MatchNames: []string{project},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createExpectedExternalCIDRPNP(namespace, clusterName, serviceUID string, ports []networkingv1.ProjectNetworkPolicyPort, cidrs []string) *globalnetworkingv1.ProjectNetworkPolicy {
+	pnpName, _ := getExternalCIDRProjectNetworkPolicyName(serviceUID)
+	ipBlocks := make([]k8snetworkingv1.IPBlock, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		ipBlocks = append(ipBlocks, k8snetworkingv1.IPBlock{CIDR: cidr})
+	}
+	return &globalnetworkingv1.ProjectNetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pnpName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				pnpLabelServiceUID: serviceUID,
+			},
+		},
+		Spec: networkingv1.ProjectNetworkPolicySpec{
+			Subject: networkingv1.ProjectNetworkPolicySubject{
+				SubjectType: networkingv1.PolicySubjectTypeUserWorkload,
+				UserWorkloadSelector: &networkingv1.WorkloadSelector{
+					LabelSelector: &networkingv1.WorkloadLabelSelector{
+						Workloads: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								lbSelectorLabel: clusterName,
+							},
+						},
+					},
+				},
+			},
+			PolicyType: networkingv1.PolicyTypeIngress,
+			Ingress: []networkingv1.ProjectNetworkPolicyIngressRule{
+				{
+					Ports: ports,
+					From: []networkingv1.ProjectNetworkPolicyPeer{
+						{
+							IPBlocks: ipBlocks,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestValidateServiceSourceAccessAndRanges(t *testing.T) {
+	tests := []struct {
+		name        string
+		svcType     string
+		service     *v1.Service
+		wantRanges  []string
+		wantErrText string
+	}{
+		{
+			name:    "unrestricted external service",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			},
+			wantRanges: nil,
+		},
+		{
+			name:    "external service with normalized IPv4 and IPv6 source ranges",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+				Spec: v1.ServiceSpec{
+					LoadBalancerSourceRanges: []string{" 137.83.231.70/32 ", "10.0.0.5/8", "2001:db8::1/32"},
+				},
+			},
+			wantRanges: []string{"10.0.0.0/8", "137.83.231.70/32", "2001:db8::/32"},
+		},
+		{
+			name:    "external service with empty allow-projects annotation (own project only)",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						externalLBAllowProjectsAnnotationKey: "   ",
+					},
+				},
+			},
+			wantRanges: nil,
+		},
+		{
+			name:    "external service with empty entry in comma-separated allow-projects",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						externalLBAllowProjectsAnnotationKey: "proj-a,,proj-b",
+					},
+				},
+			},
+			wantErrText: "contains empty project name",
+		},
+		{
+			name:    "external service with invalid DNS-1035 project name",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						externalLBAllowProjectsAnnotationKey: "123-invalid",
+					},
+				},
+			},
+			wantErrText: "contains invalid project name",
+		},
+		{
+			name:    "external service with wildcard allow-projects rejected",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						externalLBAllowProjectsAnnotationKey: "proj-a,*",
+					},
+				},
+			},
+			wantErrText: "does not support wildcard",
+		},
+		{
+			name:    "external service with empty CIDR in loadBalancerSourceRanges",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+				Spec: v1.ServiceSpec{
+					LoadBalancerSourceRanges: []string{"10.0.0.0/8", " "},
+				},
+			},
+			wantErrText: "contains empty CIDR",
+		},
+		{
+			name:    "external service spec.loadBalancerSourceRanges takes precedence over legacy annotation",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						v1.AnnotationLoadBalancerSourceRangesKey: "invalid-cidr-ignored-when-spec-is-set",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					LoadBalancerSourceRanges: []string{"192.168.1.0/24"},
+				},
+			},
+			wantRanges: []string{"192.168.1.0/24"},
+		},
+		{
+			name:    "external service invalid CIDR in legacy source-ranges annotation returns error",
+			svcType: lbExternal,
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc",
+					Namespace: "default",
+					Annotations: map[string]string{
+						v1.AnnotationLoadBalancerSourceRangesKey: "10.0.0.0/8,bad-cidr",
+					},
+				},
+			},
+			wantErrText: "contains invalid CIDR",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateServiceSourceAccess(tt.service, tt.svcType)
+			if tt.wantErrText != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrText) {
+					t.Fatalf("expected error containing %q, got %v", tt.wantErrText, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			gotRanges, err := extractLoadBalancerSourceRanges(tt.service)
+			if err != nil {
+				t.Fatalf("unexpected extractLoadBalancerSourceRanges error: %v", err)
+			}
+			if diff := cmp.Diff(tt.wantRanges, gotRanges); diff != "" {
+				t.Errorf("extractLoadBalancerSourceRanges diff (-want +got):\n%s", diff)
+			}
+		})
+	}
 }

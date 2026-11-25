@@ -40,6 +40,7 @@ const (
 	internalLBSubnetAnnotationKey        = "networking.gke.io/load-balancer-subnet"
 	externalLBIPAddressesAnnotationKey   = "networking.gke.io/load-balancer-ip-addresses"
 	internalLBAllowProjectsAnnotationKey = "networking.gke.io/load-balancer-allow-projects"
+	externalLBAllowProjectsAnnotationKey = "networking.gke.io/external-load-balancer-allow-projects"
 
 	lbTypeInternal = "internal"
 	lbTypeExternal = "external"
