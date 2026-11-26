@@ -165,6 +165,22 @@ func TestSignJWTWithKey(t *testing.T) {
 	if !ok || time.Unix(int64(exp), 0).Before(time.Now()) {
 		t.Errorf("invalid exp claim: %v", claims["exp"])
 	}
+
+	iat, ok := claims["iat"].(float64)
+	if !ok {
+		t.Fatalf("missing iat claim: %v", claims["iat"])
+	}
+	if lifetime := time.Unix(int64(exp), 0).Sub(time.Unix(int64(iat), 0)); lifetime > time.Hour {
+		t.Errorf("assertion lifetime %v exceeds 1h", lifetime)
+	}
+
+	if _, ok := claims["nbf"].(float64); !ok {
+		t.Errorf("missing nbf claim: %v", claims["nbf"])
+	}
+
+	if jti, ok := claims["jti"].(string); !ok || jti == "" {
+		t.Errorf("missing or empty jti claim: %v", claims["jti"])
+	}
 }
 
 func TestSignJWTWithKey_InvalidKey(t *testing.T) {

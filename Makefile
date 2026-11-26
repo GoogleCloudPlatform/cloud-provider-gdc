@@ -23,12 +23,13 @@ GOIMPORTS      := $(TOOLS_BIN_DIR)/goimports
 GOLANGCI_LINT  := $(TOOLS_BIN_DIR)/golangci-lint
 GINKGO         := $(TOOLS_BIN_DIR)/ginkgo
 
+GOIMPORTS_VERSION     ?= v0.52.0
 GOLANGCI_LINT_VERSION ?= v2.1.6
 GINKGO_VERSION        ?= v2.28.1
 
 $(GOIMPORTS):
 	@mkdir -p $(TOOLS_BIN_DIR)
-	GOBIN=$(abspath $(TOOLS_BIN_DIR)) go install golang.org/x/tools/cmd/goimports@latest
+	GOBIN=$(abspath $(TOOLS_BIN_DIR)) go install golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION)
 
 $(GOLANGCI_LINT):
 	@mkdir -p $(TOOLS_BIN_DIR)

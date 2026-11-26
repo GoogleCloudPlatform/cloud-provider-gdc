@@ -30,10 +30,16 @@ import (
 	"k8s.io/utils/clock"
 )
 
+// #nosec G101 -- RFC 8693 OAuth 2.0 token-type URN constants, not credentials
 const (
 	tokenExchangeType       = "urn:ietf:params:oauth:token-type:token-exchange"
 	accessTokenType         = "urn:ietf:params:oauth:token-type:access_token"
 	serviceAccountTokenType = "urn:k8s:params:oauth:token-type:serviceaccount"
+
+	// Bound STS HTTP response size (1 MiB) and error body size (4 KiB) to prevent
+	// memory exhaustion or leaking large unexpected upstream response payloads.
+	maxSTSResponseBytes  = 1 << 20
+	maxSTSErrorBodyBytes = 4 << 10
 
 	// Bound TCP dial and TLS handshake timeouts so connections hitting an
 	// unhealthy load-balancer backend fail quickly instead of stalling for 15-30s,
@@ -92,11 +98,15 @@ func NewSTSTokenSource(
 		KeepAlive: stsKeepAlivePeriod,
 	}).DialContext
 	tr.TLSHandshakeTimeout = stsTLSHandshakeTimeout
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
 	if len(cfg.caCert) != 0 {
 		caCertPool := x509.NewCertPool()
 		caCertPool.AppendCertsFromPEM(cfg.caCert)
-		tr.TLSClientConfig = &tls.Config{RootCAs: caCertPool}
+		tlsCfg.RootCAs = caCertPool
 	}
+	tr.TLSClientConfig = tlsCfg
 
 	return &stsTokenSource{
 		tokenURI:       saConfig.TokenURI,
@@ -185,7 +195,7 @@ func (ts *stsTokenSource) Token() (*oauth2.Token, error) {
 			lastErr = fmt.Errorf("fetch token: %w", doErr)
 		} else {
 			// Close resp.Body immediately inside the loop rather than deferring until Token() returns.
-			bodyBytes, readErr := io.ReadAll(resp.Body)
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxSTSResponseBytes))
 			_ = resp.Body.Close()
 			if readErr != nil {
 				lastErr = fmt.Errorf("read fetched token: %w", readErr)
@@ -194,9 +204,13 @@ func (ts *stsTokenSource) Token() (*oauth2.Token, error) {
 				lastErr = nil
 				break
 			} else {
+				errBody := bodyBytes
+				if len(errBody) > maxSTSErrorBodyBytes {
+					errBody = errBody[:maxSTSErrorBodyBytes]
+				}
 				retrieveErr := &oauth2.RetrieveError{
 					Response: resp,
-					Body:     bodyBytes,
+					Body:     errBody,
 				}
 				// Do not retry permanent 4xx client/credential errors (except 429 Too Many Requests).
 				if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < http.StatusInternalServerError {

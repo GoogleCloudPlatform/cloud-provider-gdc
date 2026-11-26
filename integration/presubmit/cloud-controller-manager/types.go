@@ -30,10 +30,11 @@ const (
 	pollInterval        = 2 * time.Second
 
 	// CCM deployment resource names
+	// #nosec G101 -- Kubernetes Secret resource names for integration tests, not credentials
 	ccmAppName            = "gdch-cloud-controller-manager"
 	ccmConfigMapName      = "ccm-cloud-provider-config"
 	ccmSASecretName       = "ccm-cloudprovider-sa"
-	ccmVClusterSecretName = "ccm-vcluster-kubeconfig"
+	ccmVClusterSecretName = "ccm-vcluster-kubeconfig" // #nosec G101 -- Kubernetes Secret object name, not a credential
 
 	// Service annotations and labels supported by cloud-provider-gdc
 	lbTypeAnnotationKey                  = "networking.gke.io/load-balancer-type"

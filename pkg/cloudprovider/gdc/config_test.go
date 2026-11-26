@@ -16,6 +16,8 @@ package gdc
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"text/template"
@@ -108,5 +110,48 @@ func TestReadCloudProviderConfig(t *testing.T) {
 
 	if diff := cmp.Diff(wantConfigFile, *gotConfigFile); diff != "" {
 		t.Errorf("readCloudProviderConfig returned unexpected diff (-want +got):\n%s", diff)
+	}
+}
+
+func TestGetServiceAccountValidatesTokenURI(t *testing.T) {
+	tests := []struct {
+		name     string
+		tokenURI string
+		wantErr  string
+	}{
+		{name: "https endpoint", tokenURI: "https://service-accounts.example.com/authenticate"},
+		{name: "no token_uri"},
+		{name: "plain http", tokenURI: "http://service-accounts.example.com/authenticate", wantErr: "must use https scheme"},
+		{name: "loopback address", tokenURI: "https://127.0.0.1/authenticate", wantErr: "must not target loopback"},
+		{name: "link-local address", tokenURI: "https://169.254.169.254/authenticate", wantErr: "must not target loopback"},
+		{name: "localhost", tokenURI: "https://localhost/authenticate", wantErr: "must not target localhost"},
+		{name: "userinfo", tokenURI: "https://user@service-accounts.example.com/authenticate", wantErr: "must not contain userinfo"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := json.Marshal(map[string]string{"name": "sa", "project": "project", "token_uri": tt.tokenURI})
+			if err != nil {
+				t.Fatalf("failed to marshal service account: %v", err)
+			}
+			path := filepath.Join(t.TempDir(), "serviceaccount.json")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatalf("failed to write service account file: %v", err)
+			}
+			t.Setenv("TEST_GDC_SERVICE_ACCOUNT", path)
+
+			serviceAccount, err := getServiceAccount("TEST_GDC_SERVICE_ACCOUNT")
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("getServiceAccount() error = %v", err)
+				}
+				if serviceAccount.TokenURI != tt.tokenURI {
+					t.Errorf("getServiceAccount() token_uri = %q, want %q", serviceAccount.TokenURI, tt.tokenURI)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("getServiceAccount() error = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }

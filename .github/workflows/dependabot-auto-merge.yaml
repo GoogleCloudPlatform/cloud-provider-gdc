@@ -17,8 +17,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   auto-merge:
@@ -27,6 +26,9 @@ jobs:
       (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]') ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
@@ -35,14 +37,13 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Auto-approve and queue auto-merge for SemVer minor/patch updates and github-actions
-      # updates; major or non-SemVer updates remain manual (or can be triggered via workflow_dispatch).
-      - name: Approve and enable auto-merge for minor, patch, and github-actions updates
+      # Auto-approve and queue auto-merge for SemVer minor/patch updates across all ecosystems;
+      # major or non-SemVer updates remain manual (or can be triggered via workflow_dispatch).
+      - name: Approve and enable auto-merge for minor and patch updates
         if: >-
           github.event_name == 'workflow_dispatch' ||
           steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.package-ecosystem == 'github-actions'
+          steps.metadata.outputs.update-type == 'version-update:semver-patch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
