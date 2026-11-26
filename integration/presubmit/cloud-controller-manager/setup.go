@@ -127,8 +127,9 @@ func setupTestEnvironment(ctx context.Context, t *testing.T) *TestEnv {
 		t.Fatalf("failed to create Zonal Management API client: %v", err)
 	}
 
-	// Clean up any stale custom test subnets from previous interrupted runs.
-	cleanupStaleCustomSubnets(ctx, t, globalClient, cfg.Project)
+	// Clean up any stale custom test subnets (and any orphaned ForwardingRules holding them)
+	// from previous interrupted runs.
+	cleanupStaleCustomSubnets(ctx, t, globalClient, mgmtClient, cfg.Project)
 
 	// 3. Create isolated host namespace on the User Cluster.
 	hostNamespace := "ccm-e2e-" + cfg.CommitHash
@@ -136,7 +137,7 @@ func setupTestEnvironment(ctx context.Context, t *testing.T) *TestEnv {
 	t.Logf("Creating host namespace %q on VUC %q", hostNamespace, cfg.VUC)
 	// Poll namespace creation so transient User Cluster API connection resets do not
 	// fail setup; treat AlreadyExists as success if a prior attempt committed server-side.
-	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		createErr := kubernetes.CreateNamespace(ctx, hostClient, hostNamespace)
 		if createErr == nil || apierrors.IsAlreadyExists(createErr) {
 			return true, nil
@@ -254,6 +255,20 @@ func setupVCluster(
 				},
 			},
 		},
+	}
+
+	// If a previous CI run for the same commit was interrupted during teardown, purge any
+	// leftover vcluster release before installing so stale terminating pods/services cannot collide.
+	staleSecret := &corev1.Secret{}
+	if getErr := hostClient.Get(ctx, client.ObjectKey{Namespace: hostNamespace, Name: "vc-" + vclusterName}, staleSecret); getErr == nil {
+		t.Logf("Found pre-existing vcluster %q in namespace %q from an interrupted run; uninstalling before fresh setup...", vclusterName, hostNamespace)
+		_, _ = helm.Uninstall(helm.UninstallOptions{
+			KubeconfigPath: hostKubeconfig,
+			ReleaseName:    vclusterName,
+			Namespace:      hostNamespace,
+			IgnoreNotFound: true,
+			Wait:           true,
+		})
 	}
 
 	t.Logf("Installing vcluster %q in namespace %q", vclusterName, hostNamespace)
@@ -613,8 +628,87 @@ management-api = %s
 	createWithRetry("Deployment "+ccmAppName, ccmDeployment)
 }
 
-func cleanupStaleCustomSubnets(ctx context.Context, t *testing.T, globalClient client.Client, project string) {
+func cleanupStaleCustomSubnets(ctx context.Context, t *testing.T, globalClient, mgmtClient client.Client, project string) {
 	t.Helper()
+
+	isStaleTestSubnetName := func(name string) bool {
+		return strings.HasPrefix(name, elbTestSubnetPrefix) || strings.HasPrefix(name, ilbTestSubnetPrefix)
+	}
+
+	purgeCompanionLBObjects := func(lbName string) {
+		if lbName == "" {
+			return
+		}
+		_ = globalClient.Delete(ctx, &ipamglobalv1.Subnet{ObjectMeta: metav1.ObjectMeta{Namespace: project, Name: lbName + subnetSuffix}})
+		_ = globalClient.Delete(ctx, &globalnetworkingv1.BackendService{ObjectMeta: metav1.ObjectMeta{Namespace: project, Name: lbName + backendServiceSuffix}})
+		_ = globalClient.Delete(ctx, &globalnetworkingv1.BackendServicePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: project, Name: lbName + backendServicePolicySuffix}})
+		_ = globalClient.Delete(ctx, &globalnetworkingv1.HealthCheck{ObjectMeta: metav1.ObjectMeta{Namespace: project, Name: lbName + healthCheckSuffix}})
+		_ = globalClient.Delete(ctx, &globalnetworkingv1.ProjectNetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: project, Name: lbName}})
+		if mgmtClient != nil {
+			_ = mgmtClient.Delete(ctx, &networkingv1.Backend{ObjectMeta: metav1.ObjectMeta{Namespace: project, Name: lbName + backendSuffix}})
+		}
+	}
+
+	// First purge any orphaned ForwardingRules (left behind if a prior run lost vcluster connectivity
+	// before deleting its test Services) that still hold references to stale custom test Subnets.
+	_ = wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		staleSubnets := make(map[string]bool)
+		var subnetList ipamglobalv1.SubnetList
+		if err := globalClient.List(ctx, &subnetList, client.InNamespace(project)); err != nil {
+			t.Logf("Transient error listing subnets during orphan LB check: %v", err)
+			return false, nil
+		}
+		for i := range subnetList.Items {
+			s := &subnetList.Items[i]
+			if isStaleTestSubnetName(s.Name) {
+				staleSubnets[s.Name] = true
+			} else if s.Spec.ParentReference != nil && isStaleTestSubnetName(s.Spec.ParentReference.Name) {
+				staleSubnets[s.Name] = true
+			}
+		}
+		if len(staleSubnets) == 0 {
+			return true, nil
+		}
+
+		remainingFRs := 0
+		var extFRList globalnetworkingv1.ForwardingRuleExternalList
+		if err := globalClient.List(ctx, &extFRList, client.InNamespace(project)); err != nil {
+			t.Logf("Transient error listing ForwardingRuleExternals during cleanup: %v", err)
+			return false, nil
+		}
+		for i := range extFRList.Items {
+			fr := &extFRList.Items[i]
+			if fr.Spec.CIDRRef != nil && staleSubnets[fr.Spec.CIDRRef.Name] {
+				remainingFRs++
+				lbName := strings.TrimSuffix(fr.Name, fwdRuleSuffix)
+				if fr.DeletionTimestamp.IsZero() {
+					t.Logf("Deleting orphaned ForwardingRuleExternal %s/%s referencing stale test Subnet %s...", project, fr.Name, fr.Spec.CIDRRef.Name)
+					_ = globalClient.Delete(ctx, fr)
+				}
+				purgeCompanionLBObjects(lbName)
+			}
+		}
+
+		var intFRList globalnetworkingv1.ForwardingRuleInternalList
+		if err := globalClient.List(ctx, &intFRList, client.InNamespace(project)); err != nil {
+			t.Logf("Transient error listing ForwardingRuleInternals during cleanup: %v", err)
+			return false, nil
+		}
+		for i := range intFRList.Items {
+			fr := &intFRList.Items[i]
+			if fr.Spec.CIDRRef != nil && staleSubnets[fr.Spec.CIDRRef.Name] {
+				remainingFRs++
+				lbName := strings.TrimSuffix(fr.Name, fwdRuleSuffix)
+				if fr.DeletionTimestamp.IsZero() {
+					t.Logf("Deleting orphaned ForwardingRuleInternal %s/%s referencing stale test Subnet %s...", project, fr.Name, fr.Spec.CIDRRef.Name)
+					_ = globalClient.Delete(ctx, fr)
+				}
+				purgeCompanionLBObjects(lbName)
+			}
+		}
+
+		return remainingFRs == 0, nil
+	})
 
 	deleteBySuffix := func(suffix string) {
 		_ = wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
@@ -626,7 +720,7 @@ func cleanupStaleCustomSubnets(ctx context.Context, t *testing.T, globalClient c
 			remaining := 0
 			for i := range subnetList.Items {
 				s := &subnetList.Items[i]
-				if (strings.HasPrefix(s.Name, elbTestSubnetPrefix) || strings.HasPrefix(s.Name, ilbTestSubnetPrefix)) && strings.HasSuffix(s.Name, suffix) {
+				if isStaleTestSubnetName(s.Name) && strings.HasSuffix(s.Name, suffix) {
 					remaining++
 					if s.DeletionTimestamp.IsZero() {
 						t.Logf("Deleting stale test Subnet %s/%s...", project, s.Name)

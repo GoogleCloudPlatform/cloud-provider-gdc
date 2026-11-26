@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	vmv1 "github.com/googlecloudplatform/google-distributed-cloud-apis/pkg/apis/public/virtualmachine/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -80,11 +81,9 @@ func runNodeControllerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 				},
 			},
 		}
-		if err := env.VClusterClient.Create(ctx, pinPod); err != nil {
-			t.Fatalf("failed to create node-pin Pod %q in vcluster: %v", pinPod.Name, err)
-		}
+		ensurePinPodCreated(ctx, t, env.VClusterClient, pinPod)
 		t.Cleanup(func() {
-			_ = env.VClusterClient.Delete(context.Background(), pinPod)
+			_ = env.VClusterClient.Delete(context.Background(), pinPod, client.GracePeriodSeconds(0))
 		})
 
 		// Ensure the Node exists and has the uninitialized taint + empty ProviderID so
@@ -207,11 +206,9 @@ func runNodeControllerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 				},
 			},
 		}
-		if err := env.VClusterClient.Create(ctx, pinPod); err != nil {
-			t.Fatalf("failed to create nonexistent-node pin Pod %q in vcluster: %v", pinPod.Name, err)
-		}
+		ensurePinPodCreated(ctx, t, env.VClusterClient, pinPod)
 		t.Cleanup(func() {
-			_ = env.VClusterClient.Delete(context.Background(), pinPod)
+			_ = env.VClusterClient.Delete(context.Background(), pinPod, client.GracePeriodSeconds(0))
 		})
 
 		t.Logf("Creating NotReady Node %q with non-existent ProviderID %q in vcluster", nonExistentName, nonExistentProviderID)
@@ -273,6 +270,29 @@ func runNodeControllerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 
 		t.Logf("Verified non-existent Node %q was automatically deleted by cloud-node-lifecycle-controller", nonExistentName)
 	})
+}
+
+// ensurePinPodCreated force-deletes any leftover fake-node pin Pod from a prior
+// interrupted run (with GracePeriodSeconds=0, since fake nodes have no kubelet)
+// and polls Pod creation across transient vcluster port-forward reconnects.
+func ensurePinPodCreated(ctx context.Context, t *testing.T, vclusterClient client.Client, template *corev1.Pod) {
+	t.Helper()
+	var lastErr error
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		_ = vclusterClient.Delete(ctx, template.DeepCopy(), client.GracePeriodSeconds(0))
+		if createErr := vclusterClient.Create(ctx, template.DeepCopy()); createErr != nil {
+			if apierrors.IsAlreadyExists(createErr) {
+				lastErr = createErr
+				return false, nil
+			}
+			lastErr = createErr
+			t.Logf("Transient error creating pin Pod %q in vcluster: %v", template.Name, createErr)
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("failed to create pin Pod %q in vcluster: %v (poll err: %v)", template.Name, lastErr, err)
+	}
 }
 
 func findRunningVirtualMachine(ctx context.Context, t *testing.T, env *TestEnv) (*vmv1.VirtualMachine, string) {

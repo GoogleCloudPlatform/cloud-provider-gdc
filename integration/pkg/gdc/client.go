@@ -115,6 +115,14 @@ func injectHermeticEnvIntoKubeconfig(path, configDir string) error {
 				clientcmdapi.ExecEnvVar{Name: "XDG_CONFIG_HOME", Value: configDir},
 			)
 			authInfo.Exec.Env = env
+			if authInfo.Exec.Command != "" && authInfo.Exec.Command != "/bin/sh" {
+				// Wrap gdcloud exec-credential invocations in a bounded retry loop so transient
+				// GDC ServiceIdentityServer 500 / connection-reset blips do not fail client-go or helm calls.
+				const retryScript = `cmd="$1"; shift; attempt=1; delay=1; while true; do err_file=$(mktemp); if out=$("$cmd" "$@" 2>"$err_file"); then rm -f "$err_file"; printf '%s\n' "$out"; exit 0; fi; rc=$?; err_msg=$(cat "$err_file" 2>/dev/null || true); rm -f "$err_file"; if [ "$attempt" -ge 4 ]; then printf '%s\n' "$err_msg" >&2; exit "$rc"; fi; sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2)); done`
+				origCmd := authInfo.Exec.Command
+				authInfo.Exec.Args = append([]string{"-c", retryScript, "gdcloud-exec-retry", origCmd}, authInfo.Exec.Args...)
+				authInfo.Exec.Command = "/bin/sh"
+			}
 		}
 	}
 

@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/cloud-provider/api"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -356,7 +357,7 @@ func (g *lb) ensureProjectNetworkPolicy(ctx context.Context, pnpName, projectNs,
 	}
 
 	klog.Infof("ensureProjectNetworkPolicy: creating/updating PNP %s", pnpName)
-	if _, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, updatedPNP, mutateFn); err != nil {
+	if err := createOrUpdateWithConflictRetry(ctx, g.globalMPClient, updatedPNP, mutateFn); err != nil {
 		return fmt.Errorf("ensureProjectNetworkPolicy %s: %w", client.ObjectKeyFromObject(updatedPNP), err)
 	}
 	return nil
@@ -405,7 +406,7 @@ func (g *lb) ensureIntFwdRule(ctx context.Context, name, namespace string, servi
 		},
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, intFwdR, func() error {
+	err := createOrUpdateWithConflictRetry(ctx, g.globalMPClient, intFwdR, func() error {
 		intFwdR.Spec = networkingv1.ForwardingRuleInternalSpec{
 			ForwardingRuleSpecCommon: networkingv1.ForwardingRuleSpecCommon{
 				BackendServiceRef: &networkingv1.BackendServiceRef{
@@ -434,23 +435,25 @@ func (g *lb) ensureIntFwdRule(ctx context.Context, name, namespace string, servi
 }
 
 func (g *lb) updateSubnetOwnerReference(ctx context.Context, subnetKey client.ObjectKey, fwdRObject metav1.Object) error {
-	subnet := &ipamglobalv1.Subnet{}
-	if err := g.globalMPClient.Get(ctx, subnetKey, subnet); err != nil {
-		if errors.IsNotFound(err) {
-			return fmt.Errorf("subnet %q not found, cannot set owner reference: %w", subnetKey.Name, err)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		subnet := &ipamglobalv1.Subnet{}
+		if err := g.globalMPClient.Get(ctx, subnetKey, subnet); err != nil {
+			if errors.IsNotFound(err) {
+				return fmt.Errorf("subnet %q not found, cannot set owner reference: %w", subnetKey.Name, err)
+			}
+			return fmt.Errorf("failed to get Subnet %q to update owner reference: %w", subnetKey.Name, err)
 		}
-		return fmt.Errorf("failed to get Subnet %q to update owner reference: %w", subnetKey.Name, err)
-	}
 
-	patchBase := client.MergeFrom(subnet.DeepCopy())
-	if err := controllerutil.SetOwnerReference(fwdRObject, subnet, g.globalMPClient.Scheme()); err != nil {
-		return fmt.Errorf("failed to to set %q as owner of Subnet %q: %w", fwdRObject.GetName(), subnet.GetName(), err)
-	}
+		patchBase := client.MergeFrom(subnet.DeepCopy())
+		if err := controllerutil.SetOwnerReference(fwdRObject, subnet, g.globalMPClient.Scheme()); err != nil {
+			return fmt.Errorf("failed to to set %q as owner of Subnet %q: %w", fwdRObject.GetName(), subnet.GetName(), err)
+		}
 
-	if err := g.globalMPClient.Patch(ctx, subnet, patchBase); err != nil {
-		return fmt.Errorf("failed to patch Subnet %q with new owner reference: %w", subnetKey.Name, err)
-	}
-	return nil
+		if err := g.globalMPClient.Patch(ctx, subnet, patchBase); err != nil {
+			return fmt.Errorf("failed to patch Subnet %q with new owner reference: %w", subnetKey.Name, err)
+		}
+		return nil
+	})
 }
 
 func (g *lb) deleteProjectNetworkPolicies(ctx context.Context, projectNs string, pnpNamesToDelete []string) error {
