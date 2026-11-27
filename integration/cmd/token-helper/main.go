@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/googlecloudplatform/cloud-provider-gdc/gdc/pkg/auth"
 )
@@ -59,7 +60,8 @@ func mintSTSToken(saPath, caPath, audience string) (string, error) {
 
 	// Read and parse the GDC ProjectServiceAccount JSON credential file, which
 	// contains the ES256 private key, key ID, project, service account name, and STS token URI.
-	saBytes, err := os.ReadFile(saPath)
+	// #nosec G304 -- CLI bootstrap tool intentionally reads operator-supplied credential file path
+	saBytes, err := os.ReadFile(filepath.Clean(saPath))
 	if err != nil {
 		return "", fmt.Errorf("read service account file %q: %w", saPath, err)
 	}
@@ -71,7 +73,8 @@ func mintSTSToken(saPath, caPath, audience string) (string, error) {
 
 	// Read the GDC Root CA certificate so the STS HTTPS client can verify the
 	// GDC ServiceIdentityServer TLS certificate.
-	caBytes, err := os.ReadFile(caPath)
+	// #nosec G304 -- CLI bootstrap tool intentionally reads operator-supplied CA file path
+	caBytes, err := os.ReadFile(filepath.Clean(caPath))
 	if err != nil {
 		return "", fmt.Errorf("read CA certificate file %q: %w", caPath, err)
 	}

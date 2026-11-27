@@ -16,7 +16,9 @@ package auth
 
 import (
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"time"
@@ -62,18 +64,30 @@ func (ts *jwtTokenSource) Token() (*oauth2.Token, error) {
 // signJWTWithKey signs a JWT using a known private key to be used with
 // the service identity server in order to exchange for an audienced
 // STS token. This only supports signing the JWT with ECDSA 256 keys.
+//
+// The assertion is re-signed on every token exchange and is only used to
+// obtain a short-lived STS token, so it is given a short validity window
+// (1 hour) and a unique jti to minimize the replay surface if captured.
 func signJWTWithKey(kid, key, sub, issuer, audience string) (string, error) {
 	priv, err := parsePrivateKey(key)
 	if err != nil {
 		return "", err
 	}
 
+	jti, err := newJTI()
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now()
 	claims := jwt.RegisteredClaims{
+		ID:        jti,
 		Issuer:    issuer,
 		Subject:   sub,
 		Audience:  jwt.ClaimStrings{audience},
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		NotBefore: jwt.NewNumericDate(now.Add(-time.Minute)),
+		ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(now),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
@@ -81,6 +95,15 @@ func signJWTWithKey(kid, key, sub, issuer, audience string) (string, error) {
 	token.Header["typ"] = "JWT"
 
 	return token.SignedString(priv)
+}
+
+// newJTI returns a random token identifier for the "jti" claim.
+func newJTI() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate jti: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // parsePrivateKey parses a private key string into an *ecdsa.PrivateKey.

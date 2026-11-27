@@ -340,6 +340,7 @@ func setupVCluster(
 			case <-pfCtx.Done():
 				return
 			default:
+				// #nosec G204 -- integration test helper port-forwarding vcluster service via kubectl
 				cmd := exec.CommandContext(pfCtx, "kubectl", "--kubeconfig", hostKubeconfig, "port-forward", "svc/"+vclusterName, fmt.Sprintf("%d:443", port), "-n", hostNamespace)
 				output, err := cmd.CombinedOutput()
 				if err != nil && !errors.Is(err, context.Canceled) {
