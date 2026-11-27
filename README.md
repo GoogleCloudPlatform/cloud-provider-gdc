@@ -26,6 +26,7 @@ This repository uses a standard Go toolchain and `Makefile` matching upstream Ga
 | `make format` | Formats all Go source files with `goimports` |
 | `make check` | Runs code linters (`golangci-lint`, `go vet`) |
 | `make unittests` | Runs unit test suite across all packages |
+| `make test-ci-scripts` | Runs the tests of the CI helper scripts (`scripts/ci-common.sh`) |
 | `make build-local` | Builds binaries locally in current environment |
 | `make release` | Builds cross-compiled release binaries |
 | `make docker-images` | Builds multi-stage Docker images for controller manager |

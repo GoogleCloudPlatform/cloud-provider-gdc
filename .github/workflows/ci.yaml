@@ -33,6 +33,11 @@ jobs:
       - name: Run lint and format checks
         run: make check
 
+      # The integration test job loads its scripts from main, so changes to
+      # them are tested here.
+      - name: Run CI script tests
+        run: make test-ci-scripts
+
       - name: Verify git status is clean after formatting
         run: |
           git diff --exit-code

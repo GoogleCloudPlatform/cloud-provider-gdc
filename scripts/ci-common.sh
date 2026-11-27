@@ -23,142 +23,267 @@ retry_cmd() {
   done
 }
 
-# is_authorized_maintainer checks whether a GitHub user is an authorized
-# maintainer (either via repository author_association or OWNERS_ALIASES/CODEOWNERS
-# read strictly from origin/main).
+# CI_TRUSTED_REF is the ref that every trust decision below reads from. It is
+# spelled out in full so that a branch or tag named "origin/main" cannot shadow
+# the remote-tracking ref of the main branch.
+CI_TRUSTED_REF="refs/remotes/origin/main"
+
+# authorized_logins prints the GitHub logins (lower case, one per line) listed
+# in OWNERS_ALIASES and CODEOWNERS on origin/main. It fails if origin/main
+# cannot be resolved or if neither file can be read from it. Files in the
+# checked-out tree are never consulted because a pull request controls them.
+authorized_logins() {
+  if ! git rev-parse --verify --quiet "${CI_TRUSTED_REF}^{commit}" >/dev/null 2>&1; then
+    echo "Cannot resolve origin/main; nobody is authorized." >&2
+    return 1
+  fi
+
+  local content found=false
+
+  # OWNERS_ALIASES: plain YAML list items ("- login"). Bot entries match the
+  # exact bot login.
+  if content=$(git show "${CI_TRUSTED_REF}:OWNERS_ALIASES" 2>/dev/null); then
+    found=true
+    printf '%s\n' "${content}" | tr -d '\r' | LC_ALL=C awk '
+      { sub(/#.*/, "") }
+      NF == 2 && $1 == "-" && $2 ~ /^[A-Za-z0-9_-]+(\[bot\])?$/ { print tolower($2) }'
+  fi
+
+  # CODEOWNERS: "@login" owners only. The path pattern, team references
+  # ("@org/team"), e-mail addresses and comments never yield a login.
+  if content=$(git show "${CI_TRUSTED_REF}:CODEOWNERS" 2>/dev/null); then
+    found=true
+    printf '%s\n' "${content}" | tr -d '\r' | LC_ALL=C awk '
+      { sub(/#.*/, "") }
+      { for (i = 2; i <= NF; i++) if ($i ~ /^@[A-Za-z0-9_-]+$/) print tolower(substr($i, 2)) }'
+  fi
+
+  if [[ "${found}" != "true" ]]; then
+    echo "Neither OWNERS_ALIASES nor CODEOWNERS can be read from origin/main; nobody is authorized." >&2
+    return 1
+  fi
+}
+
+# is_authorized_maintainer succeeds only if the given GitHub login equals,
+# case-insensitively, a login listed in OWNERS_ALIASES or CODEOWNERS on
+# origin/main. Repository or organization membership (author_association) does
+# not authorize anything, and bot entries match the exact bot login.
 is_authorized_maintainer() {
-  local actor="$1"
-  local assoc="${2:-}"
+  local actor="${1:-}"
 
-  if [[ -z "${actor}" ]]; then
+  # Empty and malformed logins are denied before any comparison.
+  if [[ ! "${actor}" =~ ^[A-Za-z0-9_-]+(\[bot\])?$ ]]; then
     return 1
   fi
 
-  local actor_lc actor_base_lc owners_list="" owners_ref="HEAD"
+  local actor_lc owners_list login
   actor_lc=$(printf '%s' "${actor}" | tr '[:upper:]' '[:lower:]')
-  actor_base_lc="${actor_lc%\[bot\]}"
-  if git rev-parse --verify origin/main >/dev/null 2>&1; then
-    owners_ref="origin/main"
-  fi
-
-  local owners_aliases_content codeowners_content
-  owners_aliases_content=$(git show "${owners_ref}:OWNERS_ALIASES" 2>/dev/null || true)
-  if [[ -n "${owners_aliases_content}" ]]; then
-    owners_list+=$(printf '%s\n' "${owners_aliases_content}" | grep -E '^[[:space:]]*-[[:space:]]*[A-Za-z0-9_-]+' | sed -E 's/^[[:space:]]*-[[:space:]]*//; s/[[:space:]]*$//' || true)
-    owners_list+=$'\n'
-  fi
-
-  codeowners_content=$(git show "${owners_ref}:CODEOWNERS" 2>/dev/null || true)
-  if [[ -n "${codeowners_content}" ]]; then
-    owners_list+=$(printf '%s\n' "${codeowners_content}" | grep -v '^#' | grep -oE '@[A-Za-z0-9_-]+' | tr -d '@' || true)
-  fi
-
-  if printf '%s\n' "${owners_list}" | tr '[:upper:]' '[:lower:]' | grep -Fxq "${actor_lc}" || \
-     printf '%s\n' "${owners_list}" | tr '[:upper:]' '[:lower:]' | sed 's/\[bot\]$//' | grep -Fxq "${actor_base_lc}"; then
-    return 0
-  fi
-
-  if [[ "${actor}" == *"[bot]" || "${actor}" == *"-robot" ]]; then
+  if ! owners_list=$(authorized_logins); then
     return 1
   fi
 
-  case "${assoc}" in
-    COLLABORATOR|MEMBER|OWNER)
+  while IFS= read -r login; do
+    if [[ -n "${login}" && "${login}" == "${actor_lc}" ]]; then
       return 0
-      ;;
-  esac
+    fi
+  done <<< "${owners_list}"
 
   return 1
 }
 
-# prepare_trusted_ci_files copies the CI runner scripts and compiles the
-# token-helper binary into an isolated directory (/tmp/ci-trusted) outside the
-# repository working tree before any untrusted PR ref is checked out. When
-# origin/main already contains the updated CI scripts and token-helper, they are
-# extracted and built strictly from origin/main.
+# prepare_trusted_ci_files stages the CI runner scripts and builds the
+# token-helper binary in an isolated directory (/tmp/ci-trusted) outside the
+# repository working tree before any untrusted PR ref is checked out. Everything
+# is taken from origin/main. There is no fallback to the checked-out tree, which
+# a pull request controls: if anything is missing, the run fails.
 prepare_trusted_ci_files() {
-  CI_TRUSTED_DIR="/tmp/ci-trusted"
+  CI_TRUSTED_DIR="${1:-/tmp/ci-trusted}"
   rm -rf "${CI_TRUSTED_DIR}"
-  mkdir -p "${CI_TRUSTED_DIR}/scripts" "${CI_TRUSTED_DIR}/bin"
+  mkdir -p "${CI_TRUSTED_DIR}/scripts" "${CI_TRUSTED_DIR}/bin" "${CI_TRUSTED_DIR}/src"
 
-  if git rev-parse --verify origin/main >/dev/null 2>&1 && \
-     git show origin/main:scripts/ci-common.sh 2>/dev/null | grep -q 'verify_pr_head_at_comment_time' && \
-     git cat-file -e origin/main:integration/cmd/token-helper/main.go 2>/dev/null; then
-    echo "Staging trusted CI scripts and token-helper from origin/main..."
-    git show origin/main:scripts/ci-common.sh > "${CI_TRUSTED_DIR}/scripts/ci-common.sh"
-    git show origin/main:scripts/ci-integration-test.sh > "${CI_TRUSTED_DIR}/scripts/ci-integration-test.sh"
-    mkdir -p "${CI_TRUSTED_DIR}/src"
-    git archive origin/main | tar -x -C "${CI_TRUSTED_DIR}/src"
-    (
-      cd "${CI_TRUSTED_DIR}/src"
-      go build -o "${CI_TRUSTED_DIR}/bin/token-helper" ./integration/cmd/token-helper
-    )
-    rm -rf "${CI_TRUSTED_DIR}/src"
-  else
-    echo "Staging trusted CI scripts and token-helper from current base checkout..."
-    cp ./scripts/ci-common.sh "${CI_TRUSTED_DIR}/scripts/ci-common.sh"
-    cp ./scripts/ci-integration-test.sh "${CI_TRUSTED_DIR}/scripts/ci-integration-test.sh"
-    if [[ -f "./integration/cmd/token-helper/main.go" ]]; then
-      go build -o "${CI_TRUSTED_DIR}/bin/token-helper" ./integration/cmd/token-helper
-    fi
+  if ! git rev-parse --verify --quiet "${CI_TRUSTED_REF}^{commit}" >/dev/null 2>&1; then
+    echo "::error::Cannot resolve origin/main; refusing to stage CI scripts from the checked-out tree."
+    exit 1
   fi
+
+  echo "Staging trusted CI scripts and token-helper from origin/main..."
+  local script
+  for script in ci-common.sh ci-integration-test.sh; do
+    if ! git show "${CI_TRUSTED_REF}:scripts/${script}" > "${CI_TRUSTED_DIR}/scripts/${script}" ||
+       [[ ! -s "${CI_TRUSTED_DIR}/scripts/${script}" ]]; then
+      echo "::error::Cannot read scripts/${script} from origin/main."
+      exit 1
+    fi
+  done
+
+  if ! git archive --format=tar --output="${CI_TRUSTED_DIR}/src.tar" "${CI_TRUSTED_REF}" ||
+     ! tar -xf "${CI_TRUSTED_DIR}/src.tar" -C "${CI_TRUSTED_DIR}/src" ||
+     ! (cd "${CI_TRUSTED_DIR}/src" && go build -o "${CI_TRUSTED_DIR}/bin/token-helper" ./integration/cmd/token-helper) ||
+     [[ ! -x "${CI_TRUSTED_DIR}/bin/token-helper" ]]; then
+    echo "::error::Cannot build the token-helper from origin/main."
+    exit 1
+  fi
+  rm -rf "${CI_TRUSTED_DIR}/src" "${CI_TRUSTED_DIR}/src.tar"
 
   chmod +x "${CI_TRUSTED_DIR}/scripts/ci-common.sh" "${CI_TRUSTED_DIR}/scripts/ci-integration-test.sh"
   export CI_TRUSTED_DIR
 }
 
-# verify_pr_head_at_comment_time ensures that when triggered via '/test-integration'
-# (issue_comment), the fetched PR head commit already existed on the PR before the
-# comment was posted, preventing a TOCTOU race if a commit is pushed right after
-# the reviewer comments.
-verify_pr_head_at_comment_time() {
-  if [[ "${GITHUB_EVENT_NAME:-}" != "issue_comment" || ! -f "${GITHUB_EVENT_PATH:-}" ]]; then
-    return 0
+# normalize_commit_sha prints the lower-case form of a full 40-character
+# hexadecimal commit SHA and fails for anything else. Abbreviated SHAs are
+# rejected: a short prefix does not identify one commit and can be collided on
+# purpose.
+normalize_commit_sha() {
+  local sha="${1:-}"
+  if [[ ! "${sha}" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    return 1
+  fi
+  printf '%s\n' "${sha}" | tr 'A-F' 'a-f'
+}
+
+# find_test_integration_command prints the first '/test-integration' command
+# line of a comment body, or nothing if the comment has none.
+find_test_integration_command() {
+  printf '%s\n' "${1:-}" | tr -d '\r' | grep -E '^[[:space:]]*/test-integration([[:space:]]|$)' | head -n 1 || true
+}
+
+# parse_test_integration_command parses a '/test-integration' command line of
+# the form
+#
+#   /test-integration [<sha>]
+#
+# and prints <sha> in lower case (or an empty line when omitted). When <sha> is
+# given, it must be the full 40-character SHA of the PR head commit; abbreviated
+# SHAs or trailing arguments are rejected. Omitting <sha> is allowed only for
+# same-repository PRs authored by an OWNERS login (enforced later in
+# fetch_reviewed_pr_head).
+parse_test_integration_command() {
+  local -a words=()
+  read -r -a words <<< "${1:-}"
+
+  if [[ "${#words[@]}" -gt 2 ]]; then
+    echo "::error::'/test-integration' accepts at most one argument (the full 40-character commit SHA). Required form: '/test-integration [sha]'." >&2
+    return 1
   fi
 
-  local comment_created_at comment_epoch
-  comment_created_at=$(jq -r '.comment.created_at // empty' "${GITHUB_EVENT_PATH}")
-  if [[ -z "${comment_created_at}" ]]; then
-    echo "::error::Missing .comment.created_at in issue_comment event payload."
-    exit 1
-  fi
-  comment_epoch=$(date -d "${comment_created_at}" +%s)
-
-  local commit_date commit_epoch
-  commit_date=$(git show -s --format=%cI "${PR_HEAD_SHA}")
-  commit_epoch=$(date -d "${commit_date}" +%s)
-  if [[ "${commit_epoch}" -gt "${comment_epoch}" ]]; then
-    echo "::error::PR #${PR_NUMBER} head commit ${PR_HEAD_SHA:0:7} was committed at ${commit_date}, which is after the '/test-integration' comment was posted at ${comment_created_at}. Aborting to prevent executing unreviewed code."
-    exit 1
-  fi
-
-  if [[ -n "${GH_TOKEN:-}" && -n "${GITHUB_REPOSITORY:-}" ]]; then
-    local latest_timeline_event_at
-    latest_timeline_event_at=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/timeline?per_page=100" 2>/dev/null | \
-      jq -rs '[ .[][] | select(.event == "committed" or .event == "head_ref_force_pushed") | (.created_at // .committer.date // empty) | select(length > 0) ] | sort | last // empty' || true)
-    if [[ -n "${latest_timeline_event_at}" ]]; then
-      local timeline_epoch
-      timeline_epoch=$(date -d "${latest_timeline_event_at}" +%s)
-      if [[ "${timeline_epoch}" -gt "${comment_epoch}" ]]; then
-        echo "::error::PR #${PR_NUMBER} had a commit or force-push at ${latest_timeline_event_at}, which is after the '/test-integration' comment was posted at ${comment_created_at}. Aborting to prevent executing unreviewed code."
-        exit 1
-      fi
-    fi
-
-    local earliest_suite_at
-    earliest_suite_at=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${PR_HEAD_SHA}/check-suites" \
-      --jq '[ .check_suites[]?.created_at // empty | select(length > 0) ] | sort | first // empty' 2>/dev/null || true)
-    if [[ -n "${earliest_suite_at}" ]]; then
-      local suite_epoch
-      suite_epoch=$(date -d "${earliest_suite_at}" +%s)
-      if [[ "${suite_epoch}" -gt "${comment_epoch}" ]]; then
-        echo "::error::PR #${PR_NUMBER} head commit ${PR_HEAD_SHA:0:7} was pushed to GitHub at ${earliest_suite_at}, which is after the '/test-integration' comment was posted at ${comment_created_at}. Aborting to prevent executing unreviewed code."
-        exit 1
-      fi
+  local sha=""
+  if [[ "${#words[@]}" -eq 2 ]]; then
+    if ! sha=$(normalize_commit_sha "${words[1]}"); then
+      echo "::error::'/test-integration' argument '${words[1]}' must be the full 40-character commit SHA. Required form: '/test-integration <sha>' (or '/test-integration' on same-repository OWNERS PRs)." >&2
+      return 1
     fi
   fi
 
-  echo "Verified PR #${PR_NUMBER} head commit ${PR_HEAD_SHA:0:7} predates '/test-integration' comment (${comment_created_at})."
+  printf '%s\n' "${sha}"
+}
+
+# print_manual_trigger_hint explains how a maintainer starts the test by hand
+# for a fork or non-OWNERS PR, printing the ready-to-copy command for the
+# current head commit when known.
+print_manual_trigger_hint() {
+  local pr_number="${1:-}"
+  local pr_head_sha="${2:-}"
+  local sha_hint="<sha>" normalized
+  if normalized=$(normalize_commit_sha "${pr_head_sha}"); then
+    sha_hint="${normalized}"
+  fi
+  echo "A maintainer listed in OWNERS_ALIASES or CODEOWNERS on main must review commit ${sha_hint} and trigger this test: comment '/test-integration ${sha_hint}' on the PR, or use workflow_dispatch with pr_number=${pr_number} and head_sha=${sha_hint}."
+}
+
+# fetch_reviewed_pr_head fetches the head of pull request PR_NUMBER and verifies
+# it matches the commit to test. For fork PRs and PRs authored by users not
+# listed in OWNERS_ALIASES/CODEOWNERS on main, EXPECTED_HEAD_SHA is required so
+# the run is bound to the exact commit a maintainer reviewed (even if the PR
+# head moves while waiting for environment approval). For same-repository PRs
+# authored by a listed OWNERS login (which already run automatically on every
+# push), omitting EXPECTED_HEAD_SHA tests the current PR head. Every failure
+# aborts; nothing from the pull request is checked out here. On success
+# PR_HEAD_SHA and COMMIT_HASH are exported.
+fetch_reviewed_pr_head() {
+  if [[ ! "${PR_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+    echo "::error::The pull request number must consist of digits only."
+    exit 1
+  fi
+
+  local expected_sha=""
+  if [[ -n "${EXPECTED_HEAD_SHA:-}" ]]; then
+    if ! expected_sha=$(normalize_commit_sha "${EXPECTED_HEAD_SHA}"); then
+      echo "::error::Invalid commit SHA '${EXPECTED_HEAD_SHA}' for PR #${PR_NUMBER}. When naming a commit, use the full 40-character SHA."
+      exit 1
+    fi
+  fi
+
+  if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+    echo "::error::GITHUB_REPOSITORY is not set; cannot read PR #${PR_NUMBER}."
+    exit 1
+  fi
+
+  local pr_json pr_state pr_base_ref pr_head_sha pr_head_repo pr_user
+  if ! pr_json=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"); then
+    echo "::error::Failed to read PR #${PR_NUMBER} from the GitHub API; refusing to test it."
+    exit 1
+  fi
+  if ! pr_state=$(jq -r '.state // empty' <<< "${pr_json}") ||
+     ! pr_base_ref=$(jq -r '.base.ref // empty' <<< "${pr_json}") ||
+     ! pr_head_sha=$(jq -r '.head.sha // empty' <<< "${pr_json}") ||
+     ! pr_head_repo=$(jq -r '.head.repo.full_name // empty' <<< "${pr_json}") ||
+     ! pr_user=$(jq -r '.user.login // empty' <<< "${pr_json}"); then
+    echo "::error::Unexpected GitHub API response for PR #${PR_NUMBER}; refusing to test it."
+    exit 1
+  fi
+  if [[ "${pr_state}" != "open" ]]; then
+    echo "::error::PR #${PR_NUMBER} is not open (state: '${pr_state}'); refusing to test it."
+    exit 1
+  fi
+  if [[ "${pr_base_ref}" != "main" ]]; then
+    echo "::error::PR #${PR_NUMBER} does not target main (base: '${pr_base_ref}'); refusing to test it."
+    exit 1
+  fi
+  if ! pr_head_sha=$(normalize_commit_sha "${pr_head_sha}"); then
+    echo "::error::Unexpected GitHub API response for PR #${PR_NUMBER} (missing or invalid head.sha); refusing to test it."
+    exit 1
+  fi
+
+  if [[ -z "${expected_sha}" ]]; then
+    if [[ "${pr_head_repo}" == "${GITHUB_REPOSITORY}" ]] && is_authorized_maintainer "${pr_user}"; then
+      expected_sha="${pr_head_sha}"
+      echo "PR #${PR_NUMBER} is a same-repository PR by authorized maintainer '${pr_user}'; using current head commit ${expected_sha}."
+    else
+      echo "::error::PR #${PR_NUMBER} is from a fork (${pr_head_repo:-unknown}) or an author ('${pr_user:-unknown}') not listed in OWNERS_ALIASES/CODEOWNERS on main, so a manual run must name the reviewed head commit. After reviewing commit ${pr_head_sha}, comment '/test-integration ${pr_head_sha}' on the PR, or set head_sha=${pr_head_sha} with pr_number=${PR_NUMBER} in workflow_dispatch."
+      exit 1
+    fi
+  fi
+
+  echo "Fetching PR #${PR_NUMBER}..."
+  local pr_ref="refs/remotes/pull/${PR_NUMBER}/head" fetched_sha
+  if ! git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:${pr_ref}"; then
+    echo "::error::Failed to fetch the head of PR #${PR_NUMBER}."
+    exit 1
+  fi
+  if ! fetched_sha=$(git rev-parse --verify --quiet "${pr_ref}^{commit}"); then
+    echo "::error::Failed to resolve the fetched head of PR #${PR_NUMBER}."
+    exit 1
+  fi
+  if [[ "${fetched_sha}" != "${expected_sha}" ]]; then
+    echo "::error::PR #${PR_NUMBER} head changed: it is ${fetched_sha}, but this run was requested for ${expected_sha}. Nothing from the PR was checked out. After reviewing commit ${fetched_sha}, trigger the test again with '/test-integration ${fetched_sha}' (or head_sha=${fetched_sha})."
+    exit 1
+  fi
+
+  PR_HEAD_SHA="${fetched_sha}"
+  export PR_HEAD_SHA
+  COMMIT_HASH="${PR_HEAD_SHA:0:7}"
+  export COMMIT_HASH
+  echo "Verified that the head of PR #${PR_NUMBER} is the reviewed commit ${PR_HEAD_SHA}."
+}
+
+# checkout_reviewed_pr_head checks out exactly the commit that
+# fetch_reviewed_pr_head verified. The pull request is not fetched again.
+checkout_reviewed_pr_head() {
+  if ! git checkout -B "pr-${PR_NUMBER}" "${PR_HEAD_SHA}" ||
+     [[ "$(git rev-parse HEAD)" != "${PR_HEAD_SHA}" ]]; then
+    echo "::error::Failed to check out the reviewed commit ${PR_HEAD_SHA} of PR #${PR_NUMBER}."
+    exit 1
+  fi
 }
 
 # should_skip_non_code_changes returns 0 (true) on pull_request events when:
@@ -173,7 +298,7 @@ should_skip_non_code_changes() {
     return 1
   fi
 
-  local non_code_regex='^(\.gitignore|\.dockerignore|\.golangci\.yaml|OWNERS.*|CODEOWNERS|LICENSE.*|NOTICE.*|VERSION|Makefile|.*\.md|docs/.*|\.github/.*|scripts/ci-common\.sh)$'
+  local non_code_regex='^(\.gitignore|\.dockerignore|\.golangci\.yaml|OWNERS.*|CODEOWNERS|LICENSE.*|NOTICE.*|VERSION|Makefile|.*\.md|docs/.*|\.github/.*|scripts/ci-common(_test)?\.sh)$'
   local pr_head_sha=""
   if [[ -f "${GITHUB_EVENT_PATH:-}" ]]; then
     pr_head_sha=$(jq -r '.pull_request.head.sha // empty' "${GITHUB_EVENT_PATH}")
@@ -262,8 +387,8 @@ should_skip_non_code_changes() {
 }
 
 # check_ci_preconditions verifies whether the integration test should run when
-# triggered by GitHub Actions, and checks out the target PR on manual dispatch
-# or '/test-integration' PR comment.
+# triggered by GitHub Actions, and checks out the reviewed head commit of the
+# target PR on manual dispatch or '/test-integration <sha>' PR comment.
 check_ci_preconditions() {
   if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
     return 0
@@ -281,22 +406,31 @@ check_ci_preconditions() {
     return 0
   fi
 
+  # pull_request and issue_comment runs are authorized from the event payload;
+  # without it nothing can be authorized.
+  if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" || "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]] &&
+     [[ ! -f "${GITHUB_EVENT_PATH:-}" ]]; then
+    echo "::error::The ${GITHUB_EVENT_NAME} event payload is missing; cannot authorize this run."
+    exit 1
+  fi
+
   if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" && -f "${GITHUB_EVENT_PATH:-}" ]]; then
-    local head_repo author_association pr_user pr_number
+    local head_repo author_association pr_user pr_number pr_head_sha
     head_repo=$(jq -r '.pull_request.head.repo.full_name // empty' "${GITHUB_EVENT_PATH}")
     author_association=$(jq -r '.pull_request.author_association // empty' "${GITHUB_EVENT_PATH}")
     pr_user=$(jq -r '.pull_request.user.login // empty' "${GITHUB_EVENT_PATH}")
     pr_number=$(jq -r '.pull_request.number // empty' "${GITHUB_EVENT_PATH}")
+    pr_head_sha=$(jq -r '.pull_request.head.sha // empty' "${GITHUB_EVENT_PATH}")
 
     if [[ "${head_repo}" != "${GITHUB_REPOSITORY:-}" ]]; then
       echo "Skipping automatic integration test for forked PR (${head_repo})."
-      echo "A maintainer must trigger this test manually by commenting '/test-integration' on the PR or via workflow_dispatch with pr_number=${pr_number}."
+      print_manual_trigger_hint "${pr_number}" "${pr_head_sha}"
       exit 1
     fi
 
-    if ! is_authorized_maintainer "${pr_user}" "${author_association}"; then
-      echo "Skipping automatic integration test for untrusted author '${pr_user}' (author_association='${author_association}')."
-      echo "A maintainer must trigger this test manually by commenting '/test-integration' on the PR or via workflow_dispatch with pr_number=${pr_number}."
+    if ! is_authorized_maintainer "${pr_user}"; then
+      echo "Skipping automatic integration test: PR author '${pr_user}' (author_association='${author_association}') is not listed in OWNERS_ALIASES or CODEOWNERS on main. Repository or organization membership does not start this test."
+      print_manual_trigger_hint "${pr_number}" "${pr_head_sha}"
       exit 1
     fi
 
@@ -308,8 +442,10 @@ check_ci_preconditions() {
     fi
   fi
 
+  local comment_id=""
+
   if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" && -f "${GITHUB_EVENT_PATH:-}" ]]; then
-    local is_pr comment_body comment_user comment_assoc comment_id
+    local is_pr comment_body comment_user comment_assoc cmd_line
     is_pr=$(jq -r '.issue.pull_request.url // empty' "${GITHUB_EVENT_PATH}")
     comment_body=$(jq -r '.comment.body // empty' "${GITHUB_EVENT_PATH}")
     comment_user=$(jq -r '.comment.user.login // empty' "${GITHUB_EVENT_PATH}")
@@ -318,7 +454,8 @@ check_ci_preconditions() {
     PR_NUMBER=$(jq -r '.issue.number // empty' "${GITHUB_EVENT_PATH}")
     export PR_NUMBER
 
-    if [[ -z "${is_pr}" ]] || ! printf '%s\n' "${comment_body}" | tr -d '\r' | grep -Eq '^[[:space:]]*/test-integration([[:space:]]|$)'; then
+    cmd_line=$(find_test_integration_command "${comment_body}")
+    if [[ -z "${is_pr}" || -z "${cmd_line}" ]]; then
       echo "Comment does not contain a '/test-integration' command line on a pull request. Skipping."
       if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
         echo "should_run=false" >> "${GITHUB_OUTPUT}"
@@ -326,20 +463,25 @@ check_ci_preconditions() {
       exit 0
     fi
 
-    if ! is_authorized_maintainer "${comment_user}" "${comment_assoc}"; then
-      echo "::error::User '${comment_user}' (author_association='${comment_assoc}') is not authorized to trigger '/test-integration'."
+    if ! is_authorized_maintainer "${comment_user}"; then
+      echo "::error::User '${comment_user}' (author_association='${comment_assoc}') is not listed in OWNERS_ALIASES or CODEOWNERS on main and cannot trigger '/test-integration'."
       exit 1
     fi
 
-    if [[ -n "${comment_id}" && -n "${GH_TOKEN:-}" && -n "${GITHUB_REPOSITORY:-}" ]]; then
-      gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}/reactions" \
-        -f content='rocket' >/dev/null 2>&1 || true
+    # The SHA (if provided) always comes from the comment, never from the environment.
+    if ! EXPECTED_HEAD_SHA=$(parse_test_integration_command "${cmd_line}"); then
+      exit 1
     fi
+    export EXPECTED_HEAD_SHA
   fi
 
   if [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" ]]; then
-    if ! is_authorized_maintainer "${GITHUB_ACTOR:-}" ""; then
-      echo "::error::User '${GITHUB_ACTOR:-}' is not authorized to trigger workflow_dispatch."
+    if ! is_authorized_maintainer "${GITHUB_ACTOR:-}"; then
+      echo "::error::User '${GITHUB_ACTOR:-}' is not listed in OWNERS_ALIASES or CODEOWNERS on main and cannot trigger workflow_dispatch."
+      exit 1
+    fi
+    if [[ -z "${PR_NUMBER:-}" && -n "${EXPECTED_HEAD_SHA:-}" ]]; then
+      echo "::error::head_sha was given without pr_number. Set pr_number to test a pull request, or leave both empty to test the selected branch."
       exit 1
     fi
   fi
@@ -347,22 +489,25 @@ check_ci_preconditions() {
   # Stage trusted CI scripts and compile token-helper before checking out any PR branch.
   prepare_trusted_ci_files
 
-  if [[ ( "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" || "${GITHUB_EVENT_NAME:-}" == "issue_comment" ) && -n "${PR_NUMBER:-}" ]]; then
+  # When triggered manually via '/test-integration' comment or
+  # workflow_dispatch with pr_number, fetch the PR head, verify it matches the
+  # reviewed commit (required for fork and non-OWNERS PRs), check out that
+  # commit, merge the current base branch, and attach a check-run to the PR's
+  # head SHA.
+  if [[ "${GITHUB_EVENT_NAME:-}" == "issue_comment" ]] ||
+     [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" && -n "${PR_NUMBER:-}" ]]; then
     local base_branch_sha
-    if git rev-parse --verify origin/main >/dev/null 2>&1; then
-      base_branch_sha="$(git rev-parse origin/main)"
-    else
-      base_branch_sha="$(git rev-parse HEAD)"
+    if ! base_branch_sha="$(git rev-parse --verify --quiet "${CI_TRUSTED_REF}^{commit}")"; then
+      echo "::error::Cannot resolve origin/main; refusing to test PR #${PR_NUMBER:-}."
+      exit 1
     fi
-    echo "Fetching and checking out PR #${PR_NUMBER}..."
-    git fetch origin "pull/${PR_NUMBER}/head:pr-${PR_NUMBER}"
-    PR_HEAD_SHA="$(git rev-parse "pr-${PR_NUMBER}")"
-    export PR_HEAD_SHA
-    COMMIT_HASH="${PR_HEAD_SHA:0:7}"
-    export COMMIT_HASH
-    verify_pr_head_at_comment_time
+    fetch_reviewed_pr_head
+    if [[ -n "${comment_id}" && -n "${GH_TOKEN:-}" && -n "${GITHUB_REPOSITORY:-}" ]]; then
+      gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}/reactions" \
+        -f content='rocket' >/dev/null 2>&1 || true
+    fi
     start_pr_check_run "${CHECK_NAME:-CCM Integration Test (GDC Staging)}"
-    git checkout "pr-${PR_NUMBER}"
+    checkout_reviewed_pr_head
     echo "Merging base branch (${base_branch_sha:0:7}) into PR #${PR_NUMBER} (${COMMIT_HASH})..."
     if ! git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
       merge --no-edit "${base_branch_sha}"; then
@@ -464,7 +609,7 @@ complete_pr_check_run() {
 
 # setup_gdc_credentials writes the GDC service account key to disk (if provided
 # via environment variable), masks all lines in GitHub Actions logs, and
-# downloads the GDC Root CA certificate.
+# downloads the GDC Root CA certificate over verified TLS.
 setup_gdc_credentials() {
   local xtrace_was_set=false
   if [[ "$-" == *x* ]]; then
@@ -522,17 +667,30 @@ setup_gdc_credentials() {
     exit 1
   fi
 
+  # The console certificate is verified against the system trust store. Labs
+  # whose console certificate is issued by a private CA provide that CA as PEM
+  # text in GDC_BOOTSTRAP_CA_PEM.
+  local bootstrap_ca_file=""
+  if [[ -n "${GDC_BOOTSTRAP_CA_PEM:-}" ]]; then
+    bootstrap_ca_file="$(mktemp)"
+    printf '%s\n' "${GDC_BOOTSTRAP_CA_PEM}" > "${bootstrap_ca_file}"
+  fi
+
   echo "Fetching GDC Root CA from console.${org}.${zone}.${lab_url}..."
   # Retry Root CA download with a short timeout in case an upstream ingress backend drops the connection.
   if ! retry_cmd wget "https://console.${org}.${zone}.${lab_url}/.well-known/certificate-authority" \
-    --no-check-certificate --timeout=10 --tries=2 -q -O "${ca_file}"; then
+    ${bootstrap_ca_file:+"--ca-certificate=${bootstrap_ca_file}"} --timeout=10 --tries=2 -q -O "${ca_file}"; then
+    rm -f "${bootstrap_ca_file}"
     echo "::error::Failed to fetch GDC Root CA from console.${org}.${zone}.${lab_url}"
     exit 1
   fi
+  rm -f "${bootstrap_ca_file}"
 }
 
 # install_gdcloud_cli downloads and installs the gdcloud CLI and
 # gdcloud-k8s-auth-plugin from the GDC management API server's CLIBundleMetadata.
+# Both requests verify the server certificate against the GDC trust bundle in
+# ca_file (downloaded by setup_gdc_credentials).
 install_gdcloud_cli() {
   local sa_file="$1"
   local ca_file="$2"
@@ -553,6 +711,11 @@ install_gdcloud_cli() {
   local -a token_helper_cmd=("go" "run" "${token_helper_pkg}")
   if [[ -n "${CI_TRUSTED_DIR:-}" && -x "${CI_TRUSTED_DIR}/bin/token-helper" ]]; then
     token_helper_cmd=("${CI_TRUSTED_DIR}/bin/token-helper")
+  elif [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    # In CI the service account key is only handed to the token-helper built
+    # from origin/main, never to one built from the checked-out tree.
+    echo "::error::The token-helper staged from origin/main is missing; refusing to build it from the checked-out tree."
+    exit 1
   elif [[ -x "${token_helper_pkg}" ]]; then
     token_helper_cmd=("${token_helper_pkg}")
   fi
@@ -579,7 +742,7 @@ install_gdcloud_cli() {
   # failures trigger retry_cmd instead of being masked by jq's exit status.
   # Listing CLIBundleMetadata on GDC staging routinely takes ~45-50s, so allow 120s
   # for response transfer while keeping a fast 5s TCP connect timeout.
-  if ! clibundle_json=$(retry_cmd curl -ksSL --fail --connect-timeout 5 --max-time 120 \
+  if ! clibundle_json=$(retry_cmd curl --cacert "${ca_file}" --proto '=https' --proto-redir '=https' -sSL --fail --connect-timeout 5 --max-time 120 \
     -H "@${auth_hdr_file}" \
     "${mgmt_url}/apis/artifactview.private.gdc.goog/v1alpha1/namespaces/ui-system/clibundlemetadata"); then
     rm -f "${auth_hdr_file}"
@@ -606,7 +769,7 @@ install_gdcloud_cli() {
   local tarball="/tmp/gdcloud_cli_linux.tar.gz"
   echo "Downloading gdcloud CLI from ${serving_url}..."
   # Wrap tarball download in retry_cmd with a 5s connect timeout to recover from dead VIP backends.
-  retry_cmd curl -kL --fail --connect-timeout 5 --retry 3 "${serving_url}?uncompressed=false" -o "${tarball}"
+  retry_cmd curl --cacert "${ca_file}" --proto '=https' --proto-redir '=https' -L --fail --connect-timeout 5 --retry 3 "${serving_url}?uncompressed=false" -o "${tarball}"
 
   local sudo_cmd=""
   if [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then

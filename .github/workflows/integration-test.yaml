@@ -14,7 +14,11 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'Pull Request number to test (leave empty to test the selected branch)'
+        description: 'Pull Request number to test (leave empty to test the selected branch). Requires head_sha for fork or non-OWNERS PRs.'
+        required: false
+        type: string
+      head_sha:
+        description: 'Full 40-character SHA of the reviewed head commit (required with pr_number for fork or non-OWNERS PRs)'
         required: false
         type: string
 
@@ -56,19 +60,23 @@ jobs:
       # (without exposing GDC secrets), stages trusted CI scripts and the
       # compiled token-helper binary in /tmp/ci-trusted, and checks out + merges
       # origin/main into the target PR when triggered via /test-integration or workflow_dispatch.
+      # Manual triggers on fork or non-OWNERS PRs name the reviewed head commit;
+      # a PR whose head changed before the job runs is not checked out.
       - name: Verify CI Preconditions
         id: preconditions
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.head_sha }}
           CHECK_NAME: CCM Integration Test (GDC Staging)
         run: |
-          git fetch origin main
+          # The gate is always loaded from main, never from the checked-out
+          # tree, which a pull request controls.
+          git fetch origin '+refs/heads/main:refs/remotes/origin/main'
           mkdir -p /tmp/ci-bootstrap
-          if git show origin/main:scripts/ci-common.sh 2>/dev/null | grep -q 'should_skip_non_code_changes'; then
-            git show origin/main:scripts/ci-common.sh > /tmp/ci-bootstrap/ci-common.sh
-          else
-            cp ./scripts/ci-common.sh /tmp/ci-bootstrap/ci-common.sh
+          if ! git show refs/remotes/origin/main:scripts/ci-common.sh > /tmp/ci-bootstrap/ci-common.sh; then
+            echo "::error::Cannot load scripts/ci-common.sh from origin/main."
+            exit 1
           fi
           source /tmp/ci-bootstrap/ci-common.sh
           verify_and_prepare_ci
@@ -88,4 +96,6 @@ jobs:
           CHECK_NAME: CCM Integration Test (GDC Staging)
           IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}/cloud-controller-manager-gdch
           GDC_CCM_SERVICE_ACCOUNT_KEY: ${{ secrets.GDC_CCM_SERVICE_ACCOUNT_KEY }}
+          # Optional PEM CA for labs whose console certificate is not publicly trusted.
+          GDC_BOOTSTRAP_CA_PEM: ${{ vars.GDC_BOOTSTRAP_CA_PEM }}
         run: bash "${CI_TRUSTED_DIR}/scripts/ci-integration-test.sh"
