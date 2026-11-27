@@ -24,8 +24,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
 	klog "k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -77,6 +79,27 @@ func configureFRPorts(ports []v1.ServicePort) []networkingv1.Port {
 	return lbPorts
 }
 
+func createOrUpdateWithConflictRetry(ctx context.Context, c client.Client, obj client.Object, f controllerutil.MutateFn) error {
+	initial := obj.DeepCopyObject()
+	attempt := 0
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if attempt > 0 {
+			resetClientObject(obj, initial)
+		}
+		attempt++
+		_, err := controllerutil.CreateOrUpdate(ctx, c, obj, f)
+		return err
+	})
+}
+
+// resetClientObject restores dst in place to a fresh copy of src so that a
+// conflict retry does not carry fields from a failed attempt into the next Get.
+func resetClientObject(dst client.Object, src runtime.Object) {
+	dstVal := reflect.ValueOf(dst)
+	srcVal := reflect.ValueOf(src.DeepCopyObject())
+	dstVal.Elem().Set(srcVal.Elem())
+}
+
 func (g *lb) createOrUpdateBackendService(ctx context.Context, name, namespace string, service *v1.Service) error {
 	backendService := &globalnetworkingv1.BackendService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -94,7 +117,7 @@ func (g *lb) createOrUpdateBackendService(ctx context.Context, name, namespace s
 		})
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, backendService, func() error {
+	return createOrUpdateWithConflictRetry(ctx, g.globalMPClient, backendService, func() error {
 		// label needed for session affinity to match against the backend service policy
 		backendService.Labels = map[string]string{
 			besSelectorLabel: name + backendServiceRefSuffix,
@@ -106,7 +129,6 @@ func (g *lb) createOrUpdateBackendService(ctx context.Context, name, namespace s
 		}
 		return nil
 	})
-	return err
 }
 
 func (g *lb) createOrUpdateBackendServicePolicy(ctx context.Context, name, namespace string) error {
@@ -117,7 +139,7 @@ func (g *lb) createOrUpdateBackendServicePolicy(ctx context.Context, name, names
 		},
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, &backendServicePolicy, func() error {
+	err := createOrUpdateWithConflictRetry(ctx, g.globalMPClient, &backendServicePolicy, func() error {
 		backendServicePolicy.Spec = networkingv1.BackendServicePolicySpec{
 			SessionAffinity: networkingv1.SessionAffinityClientIpDstPortProto,
 			Selectors: metav1.LabelSelector{
@@ -145,7 +167,7 @@ func (g *lb) createOrUpdateBackend(ctx context.Context, name, namespace, cluster
 			},
 		}
 
-		_, err := controllerutil.CreateOrUpdate(ctx, mpClient, backend, func() error {
+		err := createOrUpdateWithConflictRetry(ctx, mpClient, backend, func() error {
 			backend.Spec = networkingv1.BackendSpec{
 				EndpointsLabels: metav1.LabelSelector{
 					MatchLabels: map[string]string{
@@ -258,7 +280,7 @@ func (g *lb) ensureLeafSubnetForService(ctx context.Context, name, namespace str
 		},
 	}
 
-	_, err = controllerutil.CreateOrUpdate(ctx, g.globalMPClient, subnet, func() error {
+	err = createOrUpdateWithConflictRetry(ctx, g.globalMPClient, subnet, func() error {
 		var subnetPrefixLength int32 = 32
 		subnet.Spec = ipamglobalv1.SubnetSpec{
 			Type: ipamv1.Leaf,
@@ -377,7 +399,7 @@ func (g *lb) ensureHealthCheck(ctx context.Context, hcName, namespace string, de
 		},
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, healthCheck, func() error {
+	err := createOrUpdateWithConflictRetry(ctx, g.globalMPClient, healthCheck, func() error {
 		healthCheck.Spec = desiredSpec
 		return nil
 	})

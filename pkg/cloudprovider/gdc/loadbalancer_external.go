@@ -26,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cloud-provider/api"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	globalnetworkingv1 "github.com/googlecloudplatform/google-distributed-cloud-apis/pkg/apis/public/global/networking/v1"
 	networkingv1 "github.com/googlecloudplatform/google-distributed-cloud-apis/pkg/apis/public/networking/v1"
@@ -288,7 +287,7 @@ func (g *lb) createOrUpdateOpenAllProjectNetworkPolicy(ctx context.Context, name
 		return nil
 	}
 
-	if _, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, updatedPNP, mutateFn); err != nil {
+	if err := createOrUpdateWithConflictRetry(ctx, g.globalMPClient, updatedPNP, mutateFn); err != nil {
 		return fmt.Errorf("createOrUpdateOpenAllProjectNetworkPolicy %s: %w", client.ObjectKeyFromObject(updatedPNP), err)
 	}
 
@@ -339,7 +338,7 @@ func (g *lb) ensureExtFwdRule(ctx context.Context, name, namespace string, servi
 		},
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, g.globalMPClient, extFwdR, func() error {
+	err := createOrUpdateWithConflictRetry(ctx, g.globalMPClient, extFwdR, func() error {
 		extFwdR.Spec = networkingv1.ForwardingRuleExternalSpec{
 			ForwardingRuleSpecCommon: networkingv1.ForwardingRuleSpecCommon{
 				BackendServiceRef: &networkingv1.BackendServiceRef{

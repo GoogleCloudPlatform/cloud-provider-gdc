@@ -16,6 +16,7 @@ package gdc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -2967,4 +2969,140 @@ func createExpectedPNP(baseName, namespace, clusterName, serviceUID, project str
 		}
 	}
 	return pnp
+}
+
+type conflictOnceClient struct {
+	client.Client
+	updateCalls int
+}
+
+func (c *conflictOnceClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	c.updateCalls++
+	if c.updateCalls == 1 {
+		return k8serrors.NewConflict(schema.GroupResource{Group: "networking.global.gdc.goog", Resource: "healthchecks"}, obj.GetName(), errors.New("the object has been modified"))
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func TestCreateOrUpdateWithConflictRetry(t *testing.T) {
+	_, s, _, err := initFakeGDC()
+	if err != nil {
+		t.Fatalf("initFakeGDC: %v", err)
+	}
+	existing := &globalnetworkingv1.HealthCheck{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-hc",
+			Namespace:       "sapbtp",
+			ResourceVersion: "1",
+		},
+		Spec: networkingv1.HealthCheckSpec{
+			ProbeHandler: networkingv1.ProbeHandler{
+				HTTPHealthCheck: &networkingv1.HTTPHealthCheck{
+					Port:        10256,
+					RequestPath: "/healthz",
+				},
+			},
+		},
+	}
+	wrapped := &conflictOnceClient{Client: initFakeClient(s, existing)}
+
+	target := &globalnetworkingv1.HealthCheck{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-hc",
+			Namespace: "sapbtp",
+		},
+	}
+	err = createOrUpdateWithConflictRetry(context.Background(), wrapped, target, func() error {
+		target.Spec.HTTPHealthCheck = &networkingv1.HTTPHealthCheck{
+			Port:        30147,
+			RequestPath: "/healthz",
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected conflict to be retried cleanly, got: %v", err)
+	}
+	if wrapped.updateCalls != 2 {
+		t.Fatalf("expected 2 Update attempts, got %d", wrapped.updateCalls)
+	}
+}
+
+// mergingConflictOnceClient simulates the real client-go JSON decoder on Get:
+// decoding into a non-empty struct leaves fields absent from the server JSON
+// untouched instead of zeroing them out.
+type mergingConflictOnceClient struct {
+	client.Client
+	updateCalls int
+}
+
+func (c *mergingConflictOnceClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	fresh := obj.DeepCopyObject().(client.Object)
+	if err := c.Client.Get(ctx, key, fresh, opts...); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(fresh)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, obj)
+}
+
+func (c *mergingConflictOnceClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	c.updateCalls++
+	if c.updateCalls == 1 {
+		return k8serrors.NewConflict(schema.GroupResource{Group: "networking.global.gdc.goog", Resource: "healthchecks"}, obj.GetName(), errors.New("the object has been modified"))
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func TestCreateOrUpdateWithConflictRetryResetsObjectOnRetry(t *testing.T) {
+	_, s, _, err := initFakeGDC()
+	if err != nil {
+		t.Fatalf("initFakeGDC: %v", err)
+	}
+	existing := &globalnetworkingv1.HealthCheck{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-hc",
+			Namespace:       "sapbtp",
+			ResourceVersion: "1",
+		},
+		Spec: networkingv1.HealthCheckSpec{
+			ProbeHandler: networkingv1.ProbeHandler{
+				HTTPHealthCheck: &networkingv1.HTTPHealthCheck{
+					Port:        10256,
+					RequestPath: "/healthz",
+				},
+			},
+		},
+	}
+	baseClient := initFakeClient(s, existing)
+	wrapped := &mergingConflictOnceClient{Client: baseClient}
+
+	target := &globalnetworkingv1.HealthCheck{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-hc",
+			Namespace: "sapbtp",
+		},
+	}
+	err = createOrUpdateWithConflictRetry(context.Background(), wrapped, target, func() error {
+		if target.Labels == nil {
+			target.Labels = make(map[string]string)
+		}
+		target.Labels["added-after-upgrade"] = "true"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected conflict retry to succeed, got: %v", err)
+	}
+	if wrapped.updateCalls != 2 {
+		t.Fatalf("expected 2 Update attempts (retry must not skip Update), got %d", wrapped.updateCalls)
+	}
+
+	stored := &globalnetworkingv1.HealthCheck{}
+	if err := baseClient.Get(context.Background(), client.ObjectKey{Name: "test-hc", Namespace: "sapbtp"}, stored); err != nil {
+		t.Fatalf("get stored HealthCheck: %v", err)
+	}
+	if stored.Labels["added-after-upgrade"] != "true" {
+		t.Fatalf("expected label to be persisted after conflict retry, got labels=%v", stored.Labels)
+	}
 }

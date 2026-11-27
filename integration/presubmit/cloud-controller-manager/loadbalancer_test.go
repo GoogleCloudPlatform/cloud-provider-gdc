@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,9 +44,14 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 		svc := newLoadBalancerService(svcName, corev1.NamespaceDefault, nil)
 
 		t.Logf("Creating External LoadBalancer Service %s/%s in vcluster", svc.Namespace, svc.Name)
-		createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+		createdSvc := createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+		createdUID := string(createdSvc.UID)
 		t.Cleanup(func() {
-			deleteServiceAndWait(context.Background(), t, env.VClusterClient, svc.Namespace, svc.Name)
+			bgCtx := context.Background()
+			deleteServiceAndWait(bgCtx, t, env.VClusterClient, svc.Namespace, svc.Name)
+			if t.Failed() && createdUID != "" {
+				purgeOrphanedLBResources(bgCtx, t, env, createdUID, "a"+createdUID)
+			}
 		})
 
 		elbVIP, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, "")
@@ -113,9 +119,14 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 		})
 
 		t.Logf("Creating Internal LoadBalancer Service %s/%s in vcluster", svc.Namespace, svc.Name)
-		createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+		createdSvc := createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+		createdUID := string(createdSvc.UID)
 		t.Cleanup(func() {
-			deleteServiceAndWait(context.Background(), t, env.VClusterClient, svc.Namespace, svc.Name)
+			bgCtx := context.Background()
+			deleteServiceAndWait(bgCtx, t, env.VClusterClient, svc.Namespace, svc.Name)
+			if t.Failed() && createdUID != "" {
+				purgeOrphanedLBResources(bgCtx, t, env, createdUID, "a"+createdUID)
+			}
 		})
 
 		ilbVIP, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, "")
@@ -176,9 +187,10 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 
 	t.Run("CustomSubnetLoadBalancers", func(t *testing.T) {
 		const elbParentBranchName = "gardener-release-pipeline-parent-public-subnet"
-		elbLeafName := elbTestSubnetPrefix + cfg.CommitHash + leafSubnetSuffix
-		ilbBranchName := ilbTestSubnetPrefix + cfg.CommitHash + branchSubnetSuffix
-		ilbLeafName := ilbTestSubnetPrefix + cfg.CommitHash + leafSubnetSuffix
+		runSuffix := rand.String(4)
+		elbLeafName := fmt.Sprintf("%s%s-%s%s", elbTestSubnetPrefix, cfg.CommitHash, runSuffix, leafSubnetSuffix)
+		ilbBranchName := fmt.Sprintf("%s%s-%s%s", ilbTestSubnetPrefix, cfg.CommitHash, runSuffix, branchSubnetSuffix)
+		ilbLeafName := fmt.Sprintf("%s%s-%s%s", ilbTestSubnetPrefix, cfg.CommitHash, runSuffix, leafSubnetSuffix)
 
 		t.Cleanup(func() {
 			bgCtx := context.Background()
@@ -250,9 +262,14 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 			svc := newLoadBalancerService(svcName, corev1.NamespaceDefault, map[string]string{
 				externalLBIPAddressesAnnotationKey: elbLeafName,
 			})
-			createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdSvc := createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdUID := string(createdSvc.UID)
 			t.Cleanup(func() {
-				deleteServiceAndWait(context.Background(), t, env.VClusterClient, svc.Namespace, svc.Name)
+				bgCtx := context.Background()
+				deleteServiceAndWait(bgCtx, t, env.VClusterClient, svc.Namespace, svc.Name)
+				if t.Failed() && createdUID != "" {
+					purgeOrphanedLBResources(bgCtx, t, env, createdUID, "a"+createdUID)
+				}
 			})
 
 			vip, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, "")
@@ -285,9 +302,14 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 			svc := newLoadBalancerService(svcName, corev1.NamespaceDefault, map[string]string{
 				externalLBIPAddressesAnnotationKey: elbParentBranchName,
 			})
-			createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdSvc := createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdUID := string(createdSvc.UID)
 			t.Cleanup(func() {
-				deleteServiceAndWait(context.Background(), t, env.VClusterClient, svc.Namespace, svc.Name)
+				bgCtx := context.Background()
+				deleteServiceAndWait(bgCtx, t, env.VClusterClient, svc.Namespace, svc.Name)
+				if t.Failed() && createdUID != "" {
+					purgeOrphanedLBResources(bgCtx, t, env, createdUID, "a"+createdUID)
+				}
 			})
 
 			vip, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, "")
@@ -307,9 +329,14 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 				lbTypeAnnotationKey:           lbTypeInternal,
 				internalLBSubnetAnnotationKey: ilbLeafName,
 			})
-			createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdSvc := createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdUID := string(createdSvc.UID)
 			t.Cleanup(func() {
-				deleteServiceAndWait(context.Background(), t, env.VClusterClient, svc.Namespace, svc.Name)
+				bgCtx := context.Background()
+				deleteServiceAndWait(bgCtx, t, env.VClusterClient, svc.Namespace, svc.Name)
+				if t.Failed() && createdUID != "" {
+					purgeOrphanedLBResources(bgCtx, t, env, createdUID, "a"+createdUID)
+				}
 			})
 
 			vip, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, "")
@@ -327,9 +354,14 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 				lbTypeAnnotationKey:           lbTypeInternal,
 				internalLBSubnetAnnotationKey: ilbBranchName,
 			})
-			createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdSvc := createLoadBalancerService(ctx, t, env.VClusterClient, svc)
+			createdUID := string(createdSvc.UID)
 			t.Cleanup(func() {
-				deleteServiceAndWait(context.Background(), t, env.VClusterClient, svc.Namespace, svc.Name)
+				bgCtx := context.Background()
+				deleteServiceAndWait(bgCtx, t, env.VClusterClient, svc.Namespace, svc.Name)
+				if t.Failed() && createdUID != "" {
+					purgeOrphanedLBResources(bgCtx, t, env, createdUID, "a"+createdUID)
+				}
 			})
 
 			vip, currentSvc := waitForServiceLoadBalancerIP(ctx, t, env.VClusterClient, svc.Namespace, svc.Name, "")
@@ -346,22 +378,33 @@ func runLoadBalancerTests(ctx context.Context, t *testing.T, env *TestEnv) {
 	})
 }
 
-func createLoadBalancerService(ctx context.Context, t *testing.T, vclusterClient client.Client, template *corev1.Service) {
+func createLoadBalancerService(ctx context.Context, t *testing.T, vclusterClient client.Client, template *corev1.Service) *corev1.Service {
 	t.Helper()
-	var lastErr error
-	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	var (
+		created *corev1.Service
+		lastErr error
+	)
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		svc := template.DeepCopy()
 		if createErr := vclusterClient.Create(ctx, svc); createErr != nil {
 			if apierrors.IsAlreadyExists(createErr) {
-				return true, nil
+				existing := &corev1.Service{}
+				if getErr := vclusterClient.Get(ctx, client.ObjectKeyFromObject(template), existing); getErr == nil {
+					created = existing
+					return true, nil
+				}
+				lastErr = createErr
+				return false, nil
 			}
 			lastErr = createErr
 			return false, nil
 		}
+		created = svc
 		return true, nil
 	}); err != nil {
 		t.Fatalf("failed to create Service %s/%s: %v (poll err: %v)", template.Namespace, template.Name, lastErr, err)
 	}
+	return created
 }
 
 func newLoadBalancerService(name, namespace string, annotations map[string]string) *corev1.Service {
@@ -407,7 +450,7 @@ func mutateServiceWithRetry(
 	t.Helper()
 	updated := &corev1.Service{}
 	var lastErr error
-	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		if getErr := vclusterClient.Get(ctx, key, updated); getErr != nil {
 			lastErr = getErr
 			t.Logf("Transient error getting Service %s: %v", key, getErr)
@@ -872,6 +915,34 @@ func deleteServiceAndWait(ctx context.Context, t *testing.T, vclusterClient clie
 	waitForObjectDeleted(ctx, t, vclusterClient, key, &corev1.Service{})
 }
 
+// purgeOrphanedLBResources directly removes Global and Zonal UNET LoadBalancer objects when a
+// test fails and vcluster connectivity may be lost before CCM can process Service finalizers.
+func purgeOrphanedLBResources(ctx context.Context, t *testing.T, env *TestEnv, svcUID, lbName string) {
+	t.Helper()
+	_ = wait.PollUntilContextTimeout(ctx, pollInterval, 90*time.Second, true, func(ctx context.Context) (bool, error) {
+		_ = env.GlobalClient.Delete(ctx, &globalnetworkingv1.ForwardingRuleExternal{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName + fwdRuleSuffix}})
+		_ = env.GlobalClient.Delete(ctx, &globalnetworkingv1.ForwardingRuleInternal{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName + fwdRuleSuffix}})
+		_ = env.GlobalClient.Delete(ctx, &ipamglobalv1.Subnet{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName + subnetSuffix}})
+		_ = env.GlobalClient.Delete(ctx, &globalnetworkingv1.BackendService{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName + backendServiceSuffix}})
+		_ = env.GlobalClient.Delete(ctx, &globalnetworkingv1.BackendServicePolicy{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName + backendServicePolicySuffix}})
+		_ = env.GlobalClient.Delete(ctx, &globalnetworkingv1.HealthCheck{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName + healthCheckSuffix}})
+		_ = env.GlobalClient.Delete(ctx, &globalnetworkingv1.ProjectNetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName}})
+		_ = env.MgmtClient.Delete(ctx, &networkingv1.Backend{ObjectMeta: metav1.ObjectMeta{Namespace: env.Project, Name: lbName + backendSuffix}})
+
+		var pnpList globalnetworkingv1.ProjectNetworkPolicyList
+		if err := env.GlobalClient.List(ctx, &pnpList, client.InNamespace(env.Project), client.MatchingLabels{pnpLabelServiceUID: svcUID}); err == nil {
+			for i := range pnpList.Items {
+				_ = env.GlobalClient.Delete(ctx, &pnpList.Items[i])
+			}
+		}
+
+		extErr := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + fwdRuleSuffix}, &globalnetworkingv1.ForwardingRuleExternal{})
+		intErr := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + fwdRuleSuffix}, &globalnetworkingv1.ForwardingRuleInternal{})
+		sbErr := env.GlobalClient.Get(ctx, client.ObjectKey{Namespace: env.Project, Name: lbName + subnetSuffix}, &ipamglobalv1.Subnet{})
+		return apierrors.IsNotFound(extErr) && apierrors.IsNotFound(intErr) && apierrors.IsNotFound(sbErr), nil
+	})
+}
+
 type testSubnetSpec struct {
 	Namespace       string
 	Name            string
@@ -893,7 +964,12 @@ func ensureTestSubnet(ctx context.Context, t *testing.T, globalClient client.Cli
 			Name:      spec.Name,
 		},
 	}
-	if err := wait.PollUntilContextTimeout(ctx, pollInterval, time.Minute, true, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		existing := &ipamglobalv1.Subnet{}
+		if getErr := globalClient.Get(ctx, client.ObjectKey{Namespace: spec.Namespace, Name: spec.Name}, existing); getErr == nil && !existing.DeletionTimestamp.IsZero() {
+			t.Logf("Waiting for terminating Subnet %s/%s to finish deleting before recreating...", spec.Namespace, spec.Name)
+			return false, nil
+		}
 		_, err := controllerutil.CreateOrUpdate(ctx, globalClient, s, func() error {
 			if s.Annotations == nil {
 				s.Annotations = make(map[string]string)
@@ -919,7 +995,7 @@ func ensureTestSubnet(ctx context.Context, t *testing.T, globalClient client.Cli
 	}
 
 	var cidr string
-	if err := wait.PollUntilContextTimeout(ctx, pollInterval, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextTimeout(ctx, pollInterval, reconcileTimeout, true, func(ctx context.Context) (bool, error) {
 		current := &ipamglobalv1.Subnet{}
 		if getErr := globalClient.Get(ctx, client.ObjectKey{Namespace: spec.Namespace, Name: spec.Name}, current); getErr != nil {
 			return retryableGetErr(t, fmt.Sprintf("Subnet %s/%s", spec.Namespace, spec.Name), getErr)
